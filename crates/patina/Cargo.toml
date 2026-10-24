@@ -1,0 +1,5 @@
+[package]
+name = "patina"
+version = "0.1.0"
+edition = "2021"
+description = "A thin typed layer over tcgen05: Rust DSL tracing Blackwell kernels into the Patina MLIR dialect"
