@@ -51,10 +51,11 @@ fn k_advance_is_two_core_matrices() {
 
 // --- UMMA instruction descriptor (kind::f16, dense) ------------------------
 // c_format=F32(1)<<4 | n_dim=(N>>3)<<17 | m_dim=(M>>4)<<24; rest zero
+// (qualified paths: the test fns below would otherwise shadow the imports)
 #[test]
 fn idesc_f16() {
-    assert_eq!(idesc_f16(128, 128), (1 << 4) | ((128 >> 3) << 17) | ((128 >> 4) << 24));
-    assert_eq!(idesc_f16(64, 256),  (1 << 4) | ((256 >> 3) << 17) | ((64  >> 4) << 24));
+    assert_eq!(patina::layout::idesc_f16(128, 128), (1 << 4) | ((128 >> 3) << 17) | ((128 >> 4) << 24));
+    assert_eq!(patina::layout::idesc_f16(64, 256),  (1 << 4) | ((256 >> 3) << 17) | ((64  >> 4) << 24));
 }
 
 // --- TMEM lane addressing ---------------------------------------------------
@@ -62,8 +63,8 @@ fn idesc_f16() {
 // TMEM address, i.e. warp rank shifts in as (w << 21).
 #[test]
 fn tmem_lane_offset() {
-    assert_eq!(tmem_lane_offset(0), 0 << 21);
-    assert_eq!(tmem_lane_offset(3), 3 << 21);
+    assert_eq!(patina::layout::tmem_lane_offset(0), 0 << 21);
+    assert_eq!(patina::layout::tmem_lane_offset(3), 3 << 21);
 }
 
 // --- byte counts used by expect_tx ------------------------------------------
