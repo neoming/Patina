@@ -6,6 +6,7 @@
 
 #include "patina-c/PatinaCAPI.h"
 
+#include "patina/Passes.h"
 #include "patina/PatinaDialect.h"
 
 #include "mlir/IR/BuiltinOps.h"
@@ -66,11 +67,35 @@ char *patina_verify(PatinaContext *ctx, const char *mlir_text) {
 
 char *patina_lower_to_ptx(PatinaContext *ctx, const char *mlir_text,
                           char **err_out) {
-  (void)ctx;
-  (void)mlir_text;
-  if (err_out)
-    *err_out = dupCString("patina_lower_to_ptx: unimplemented (M2c)");
-  return nullptr;
+  auto failWith = [&](llvm::StringRef msg) -> char * {
+    if (err_out)
+      *err_out = dupCString(msg);
+    return nullptr;
+  };
+  if (!ctx || !mlir_text)
+    return failWith("patina_lower_to_ptx: null argument");
+
+  mlir::OwningOpRef<mlir::ModuleOp> module;
+  {
+    std::string diags;
+    llvm::raw_string_ostream os(diags);
+    mlir::ScopedDiagnosticHandler handler(
+        &ctx->ctx, [&](mlir::Diagnostic &d) {
+          d.print(os);
+          os << "\n";
+          return mlir::success();
+        });
+    module = mlir::parseSourceString<mlir::ModuleOp>(mlir_text, &ctx->ctx);
+    if (!module || mlir::failed(mlir::verify(module.get())))
+      return failWith(os.str());
+  }
+
+  std::string err;
+  std::optional<std::string> ptx =
+      patina::lowerModuleToPTX(module.get(), err);
+  if (!ptx)
+    return failWith(err);
+  return dupCString(*ptx);
 }
 
 void patina_string_free(char *s) { std::free(s); }

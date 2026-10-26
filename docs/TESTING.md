@@ -12,6 +12,8 @@ compiles or runs yet — the tests going green *is* the milestone.
 | `crates/patina/tests/golden_v1_gemm.rs` | Rust → dialect | `cargo test` (M1b: trace + printer) | the full public DSL API surface + text-exact dialect output |
 | `crates/patina/tests/golden/v1_gemm.mlir` | dialect | compared by the test above; later `patina-opt %s` | the golden dialect syntax for the v1 warp-specialized GEMM |
 | `dialect/tests/verifier.mlir` | dialect | `patina-opt --verify-diagnostics --split-input-file` (M1c) | every structural rule: role legality, expect_tx byte match, TMEM alloc/dealloc pairing, phase ordering, role/block warp budget |
+| `crates/patina/tests/ffi_verify.rs` | dialect via C ABI | `cargo test` (M2b) | traced dialect verifies through `patina::ffi::verify`; broken text returns diagnostics |
+| `crates/patina/tests/lower_ptx.rs` + `crates/patina/tests/golden/v1_gemm.ptx` | dialect → PTX | `cargo test` (M2c) | trace → emit → `patina::ffi::lower_to_ptx` matches the golden PTX; instruction inventory pinned (2 TMA copies, 2 UMMA steps with scaleC 0→1, 4 TMEM loads, barrier choreography); golden compiles under `ptxas -arch=sm_100a` |
 
 ## Running (once the code exists)
 
@@ -26,6 +28,15 @@ BLESS=1 cargo test --test golden_v1_gemm   # rewrite golden after intentional ch
 # M1c/M2a: dialect verifier contract (build patina-opt first, see mlir/README.md)
 mlir/build/bin/patina-opt --verify-diagnostics --split-input-file dialect/tests/verifier.mlir
 mlir/build/bin/patina-opt crates/patina/tests/golden/v1_gemm.mlir   # golden verifies clean
+
+# M2b: C ABI + Rust FFI (build.rs compiles the mlir/ subproject into OUT_DIR)
+cargo test --test ffi_verify
+
+# M2c: dialect -> PTX lowering
+cargo test --test lower_ptx
+BLESS=1 cargo test --test lower_ptx    # rewrite the golden PTX after intentional changes
+mlir/build/bin/patina-opt -lower-to-ptx crates/patina/tests/golden/v1_gemm.mlir
+~/.local/cuda-12.8/bin/ptxas -arch=sm_100a crates/patina/tests/golden/v1_gemm.ptx
 ```
 
 ## Rules for changing tests

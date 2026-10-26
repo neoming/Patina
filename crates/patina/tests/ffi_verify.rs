@@ -82,10 +82,3 @@ fn unparseable_text_returns_diagnostic() {
     let err = ffi::verify("this is not mlir at all").expect_err("garbage must fail to parse");
     assert!(!err.is_empty(), "diagnostic must not be empty");
 }
-
-#[test]
-fn lower_to_ptx_stub_reports_unimplemented() {
-    // M2b: the C ABI exposes lower_to_ptx as a stub; M2c implements it.
-    let err = ffi::lower_to_ptx(&trace_v1()).expect_err("stub must return Err");
-    assert!(err.contains("unimplemented"), "unexpected diagnostic: {err}");
-}

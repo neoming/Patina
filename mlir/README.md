@@ -49,7 +49,15 @@ mlir/build/bin/patina-opt crates/patina/tests/golden/v1_gemm.mlir
 # verifier contract: 5 expected-error cases
 mlir/build/bin/patina-opt --verify-diagnostics --split-input-file \
   dialect/tests/verifier.mlir
+
+# lower the golden kernel to PTX (goes to stdout, followed by an empty
+# `module {}` from the driver)
+mlir/build/bin/patina-opt -lower-to-ptx crates/patina/tests/golden/v1_gemm.mlir
 ```
+
+The same lowering is reachable from Rust via `patina::ffi::lower_to_ptx`;
+the crate's build script builds this CMake project into the cargo OUT_DIR
+and links `libpatina_mlir_c` (see `crates/patina/build.rs`).
 
 ## Layout
 
@@ -58,7 +66,9 @@ mlir/build/bin/patina-opt --verify-diagnostics --split-input-file \
 - `include/patina/PatinaDialect.h`, `PatinaOps.h` — umbrella headers; the op
   header also declares the name-resolution helpers used by verifiers.
 - `lib/` — dialect registration (attr/type parse dispatch), custom op
-  parse/print, the five structural verifiers, custom type parse/print.
+  parse/print, the five structural verifiers, custom type parse/print, and
+  `LowerToPTX.cpp` (the v1 `patina.kernel` → PTX emitter).
+- `lib/capi/` — `libpatina_mlir_c.so`: the C ABI (`include/patina-c/`).
 - `tools/patina-opt/` — MlirOptMain driver with the patina dialect registered.
 
 `mlir/build/` is git-ignored.

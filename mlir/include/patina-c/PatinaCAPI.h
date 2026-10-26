@@ -30,8 +30,8 @@ char *patina_verify(PatinaContext *ctx, const char *mlir_text);
 /// Lower the patina kernel in `mlir_text` to PTX text.
 /// On success returns heap-allocated PTX source and leaves *err_out NULL.
 /// On failure returns NULL and sets *err_out to a heap-allocated diagnostic
-/// (when err_out itself is non-NULL).
-/// M2b: stub — always fails with "patina_lower_to_ptx: unimplemented (M2c)".
+/// (when err_out itself is non-NULL). The v1 lowering covers the v1
+/// warp-specialized kernel form only.
 char *patina_lower_to_ptx(PatinaContext *ctx, const char *mlir_text,
                           char **err_out);
 

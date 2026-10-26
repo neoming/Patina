@@ -65,7 +65,8 @@ pub fn verify(mlir_text: &str) -> Result<(), String> {
 }
 
 /// Lower the patina kernel in `mlir_text` to PTX source text.
-/// (M2b stub: always returns `Err("patina_lower_to_ptx: unimplemented (M2c)")`.)
+/// `Ok(ptx)` on success; `Err(diagnostic)` on parse, verify, or
+/// unsupported-shape failures (the v1 lowering covers the v1 kernel form).
 pub fn lower_to_ptx(mlir_text: &str) -> Result<String, String> {
     let text = c_text(mlir_text)?;
     let ctx = Context::new();
