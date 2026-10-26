@@ -310,9 +310,13 @@ struct Lowerer {
         std::string map = nameOf(load.getMapAttr());
         std::string dst = nameOf(load.getDstAttr());
         std::string bar = nameOf(load.getCompleteAttr());
-        for (int64_t c : load.getCoords())
-          if (c != 0)
+        for (Attribute c : load.getCoords()) {
+          if (isa<StringAttr>(c))
+            return fail("v1 lowering: runtime TMA coords need the pipelined "
+                        "(M3) lowering");
+          if (cast<IntegerAttr>(c).getInt() != 0)
             return fail("v1 lowering: only zero TMA coords are supported");
+        }
         if (!smem.count(dst))
           return fail("v1 lowering: tma_load dst is not a smem_alloc");
         if (!zeroEmitted) {

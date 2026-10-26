@@ -1,4 +1,4 @@
-//===- PatinaOps.td - Patina dialect ops --------------------*- tablegen -*-===//
+//===- PatinaOps.td - Patina dialect ops ------------------*- tablegen -*-===//
 //
 // Ops of the Patina dialect, one level above PTX (PROPOSAL §6). Every op
 // names its PTX realization in its description.
@@ -11,6 +11,11 @@
 // Ops marked hasVerifier declare C++ verifiers whose diagnostics are the
 // contract in dialect/tests/verifier.mlir — change them only together with
 // that file (docs/TESTING.md rules).
+//
+// M3 (pipelined mainloop) adds: pipeline.create, staged smem_alloc,
+// stage_buf, wait_stage, expect_tx_stage, for/yield, stage_next, muli, nez,
+// the dynamic `accum %cond` form of umma.step, and the staged
+// (pipe, kind, stage) barrier triple on tma_load / umma.commit.
 //
 //===----------------------------------------------------------------------===//
 
@@ -87,18 +92,106 @@ def Patina_RoleOp : Patina_Op<"role", [NoTerminator]> {
 }
 
 //===----------------------------------------------------------------------===//
+// Runtime control flow (M3)
+//===----------------------------------------------------------------------===//
+
+def Patina_ForOp : Patina_Op<"for", [NoTerminator,
+    DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmBlockArgumentNames"]>]> {
+  let summary = "runtime loop with loop-carried values (stage, phase)";
+  let description = [{
+    `patina.for %i = 0 to %bound iter_args(%s = 0, %ph = 1) { ... }` — a
+    RUNTIME loop (not trace-time unrolling). The index and every iter_arg
+    are `!patina.u32` block arguments of the body region; the body's last
+    op is a `patina.yield` of the next iter_arg values.
+  }];
+  let arguments = (ins
+    StrAttr:$index_name,
+    StrAttr:$bound,
+    TypedArrayAttrBase<StrAttr, "iter arg names">:$iter_names,
+    DenseI64ArrayAttr:$iter_inits);
+  let regions = (region SizedRegion<1>:$body);
+  let hasCustomAssemblyFormat = 1;
+}
+
+def Patina_YieldOp : Patina_Op<"yield", []> {
+  let summary = "yield the next loop-carried values of patina.for";
+  let description = [{
+    Verifier (arity) — the value count must equal the enclosing loop's
+    iter_args count:
+      "patina.yield operand count (1) does not match patina.for iter_args (2)"
+  }];
+  let arguments = (ins
+    TypedArrayAttrBase<StrAttr, "yielded value names">:$values);
+  let hasCustomAssemblyFormat = 1;
+  let hasVerifier = 1;
+}
+
+def Patina_MuliOp : Patina_Op<"muli", [Patina_NamedResult]> {
+  let summary = "runtime scalar multiply by a compile-time constant";
+  let description = [{
+    Lowers to `shl.b32` / `mul.lo.u32`; used for the per-tile TMA
+    K-coordinate advance.
+  }];
+  let arguments = (ins StrAttr:$value_name, StrAttr:$x, I32Attr:$k);
+  let results = (outs Patina_U32Type:$result);
+  let hasCustomAssemblyFormat = 1;
+}
+
+def Patina_NezOp : Patina_Op<"nez", [Patina_NamedResult]> {
+  let summary = "1 while the operand is nonzero (dynamic scaleC source)";
+  let description = [{
+    Lowers to `setp.ne.u32` + `selp.b32`; the pipelined mainloop passes
+    `nez(i)` as the dynamic scaleC of the first UMMA step of each tile.
+  }];
+  let arguments = (ins StrAttr:$value_name, StrAttr:$x);
+  let results = (outs Patina_U32Type:$result);
+  let hasCustomAssemblyFormat = 1;
+}
+
+//===----------------------------------------------------------------------===//
 // CTA-scope resources
 //===----------------------------------------------------------------------===//
+
+def Patina_PipelineCreateOp : Patina_Op<"pipeline.create",
+    [Patina_NamedResult]> {
+  let summary = "create an S-stage ring pipeline (full[S] + empty[S])";
+  let description = [{
+    Owns two mbarrier arrays of S entries each. Phase convention: the
+    producer waits `empty[s]` with initial phase 1 and publishes `full[s]`;
+    the consumer waits `full[s]` with initial phase 0 and releases
+    `empty[s]`; the phase flips when the stage wraps mod S.
+  }];
+  let arguments = (ins StrAttr:$value_name, I32Attr:$stages);
+  let results = (outs Patina_PipelineType:$result);
+  let hasCustomAssemblyFormat = 1;
+}
 
 def Patina_SmemAllocOp : Patina_Op<"smem_alloc", [Patina_NamedResult]> {
   let summary = "static smem allocation of a typed tensor";
   let description = [{
     Lowers to static smem + `cvta.to.shared`. The result type carries the
-    layout, so descriptor derivation exists only where legal.
+    layout, so descriptor derivation exists only where legal. With
+    `stages = S` the buffer holds S contiguous tiles of the type's shape,
+    sliced per stage by `patina.stage_buf`.
   }];
-  let arguments = (ins StrAttr:$value_name);
+  let arguments = (ins StrAttr:$value_name, OptionalAttr<I32Attr>:$stages);
   let results = (outs Patina_TensorType:$result);
   let hasCustomAssemblyFormat = 1;
+}
+
+def Patina_StageBufOp : Patina_Op<"stage_buf", [Patina_NamedResult]> {
+  let summary = "the stage-s slice of a staged smem_alloc";
+  let description = [{
+    Same tensor type as the base buffer; addressing (base + s * tile bytes)
+    is derived at lowering.
+
+    Verifier — the base must be a staged smem_alloc:
+      "patina.stage_buf requires a staged smem_alloc (stages > 1)"
+  }];
+  let arguments = (ins StrAttr:$value_name, StrAttr:$base, StrAttr:$stage);
+  let results = (outs Patina_TensorType:$result);
+  let hasCustomAssemblyFormat = 1;
+  let hasVerifier = 1;
 }
 
 def Patina_MBarrierCreateOp : Patina_Op<"mbarrier.create",
@@ -154,13 +247,38 @@ def Patina_ExpectTxOp : Patina_Op<"expect_tx", []> {
   let hasVerifier = 1;
 }
 
+def Patina_ExpectTxStageOp : Patina_Op<"expect_tx_stage", []> {
+  let summary = "expect_tx on one stage barrier of a pipeline";
+  let description = [{
+    `patina.expect_tx_stage %pipe, full, %s, N` — publish the expected
+    transaction bytes on the pipeline's `full[s]` barrier.
+
+    Verifier (byte match) — `bytes` must equal the sum of the bytes of every
+    staged `patina.tma_load` completing on the same (pipeline, kind):
+      "expect_tx_stage bytes (4096) != sum of tma_load bytes on this stage
+       barrier (8192)"
+  }];
+  let arguments = (ins
+    StrAttr:$pipe, StrAttr:$kind, StrAttr:$stage, I64Attr:$bytes);
+  let hasCustomAssemblyFormat = 1;
+  let hasVerifier = 1;
+}
+
 def Patina_TmaLoadOp : Patina_Op<"tma_load", []> {
   let summary = "cp.async.bulk.tensor.4d from a tensor map into smem";
+  let description = [{
+    Coordinates are integers (compile-time) or `%name` references to
+    `!patina.u32` runtime scalars. The completion target is either a
+    standalone mbarrier (`complete %bar`) or a pipeline stage
+    (`complete %pipe, full, %s`).
+  }];
   let arguments = (ins
     StrAttr:$map,
     StrAttr:$dst,
-    DenseI64ArrayAttr:$coords,
-    StrAttr:$complete);
+    ArrayAttr:$coords,
+    StrAttr:$complete,
+    OptionalAttr<StrAttr>:$complete_kind,
+    OptionalAttr<StrAttr>:$complete_stage);
   let hasCustomAssemblyFormat = 1;
 }
 
@@ -176,6 +294,32 @@ def Patina_WaitOp : Patina_Op<"wait", []> {
   let arguments = (ins StrAttr:$barrier, I32Attr:$phase);
   let hasCustomAssemblyFormat = 1;
   let hasVerifier = 1;
+}
+
+def Patina_WaitStageOp : Patina_Op<"wait_stage", []> {
+  let summary = "wait one pipeline stage barrier with a runtime phase";
+  let description = [{
+    `patina.wait_stage %pipe, empty, %s, %ph` — the phase is a runtime
+    `!patina.u32` value (ring pipelines make type-level phases impossible).
+
+    Verifier (role rule) — `empty` waits belong to the producer (load role),
+    `full` waits to the consumer (mma role):
+      "'patina.wait_stage' on 'empty' barriers is only legal in a 'load'
+       role region"
+  }];
+  let arguments = (ins
+    StrAttr:$pipe, StrAttr:$kind, StrAttr:$stage, StrAttr:$phase);
+  let hasCustomAssemblyFormat = 1;
+  let hasVerifier = 1;
+}
+
+def Patina_StageNextOp : Patina_Op<"stage_next", [Patina_NamedResult]> {
+  let summary = "advance the ring: stage +1 mod S, phase flip on wrap";
+  let arguments = (ins
+    StrAttr:$stage_name, StrAttr:$phase_name,
+    StrAttr:$s, StrAttr:$ph, StrAttr:$pipe);
+  let results = (outs Patina_U32Type:$next_stage, Patina_U32Type:$next_phase);
+  let hasCustomAssemblyFormat = 1;
 }
 
 //===----------------------------------------------------------------------===//
@@ -204,9 +348,12 @@ def Patina_UmmaStepOp : Patina_Op<"umma.step", []> {
   let summary = "one K16 tcgen05.mma; accum=false zeroes the acc input";
   let description = [{
     `accum` maps to the scaleC predicate of `tcgen05.mma` (false on the
-    first K16 step). Role-legality verifier as on `patina.umma.begin`.
+    first K16 step). The dynamic form `patina.umma.step %m, accum %cond`
+    takes scaleC from a runtime `!patina.u32` scalar (pipelined mainloop:
+    `i != 0`). Role-legality verifier as on `patina.umma.begin`.
   }];
-  let arguments = (ins StrAttr:$m, BoolAttr:$accum);
+  let arguments = (ins StrAttr:$m, BoolAttr:$accum,
+                   OptionalAttr<StrAttr>:$accum_ref);
   let hasCustomAssemblyFormat = 1;
   let hasVerifier = 1;
 }
@@ -225,7 +372,14 @@ def Patina_UmmaAdvanceKOp : Patina_Op<"umma.advance_k", []> {
 
 def Patina_UmmaCommitOp : Patina_Op<"umma.commit", []> {
   let summary = "tcgen05.commit: arrive on an mbarrier when MMAs complete";
-  let arguments = (ins StrAttr:$m, StrAttr:$barrier);
+  let description = [{
+    The target is either a standalone mbarrier (`-> %bar`) or a pipeline
+    stage (`-> %pipe, empty, %s`), the latter releasing the consumed stage
+    back to the producer. Role-legality verifier as on `patina.umma.begin`.
+  }];
+  let arguments = (ins StrAttr:$m, StrAttr:$barrier,
+                   OptionalAttr<StrAttr>:$barrier_kind,
+                   OptionalAttr<StrAttr>:$barrier_stage);
   let hasCustomAssemblyFormat = 1;
   let hasVerifier = 1;
 }

@@ -233,10 +233,204 @@ void RoleOp::print(OpAsmPrinter &p) {
 }
 
 //===----------------------------------------------------------------------===//
+// Runtime control flow (M3)
+//===----------------------------------------------------------------------===//
+
+ParseResult ForOp::parse(OpAsmParser &parser, OperationState &result) {
+  Builder &b = parser.getBuilder();
+
+  // `patina.for %i = 0 to %bound iter_args(%s = 0, %ph = 1) { ... }`
+  OpAsmParser::UnresolvedOperand ix;
+  int64_t lo;
+  if (parser.parseOperand(ix, /*allowResultNumber=*/false) ||
+      parser.parseEqual() || parser.parseInteger(lo))
+    return failure();
+  if (lo != 0) {
+    parser.emitError(parser.getCurrentLocation(), "patina.for is zero-based");
+    return failure();
+  }
+  OpAsmParser::UnresolvedOperand bound;
+  if (parser.parseKeyword("to") ||
+      parser.parseOperand(bound, /*allowResultNumber=*/false))
+    return failure();
+  result.addAttribute("index_name", b.getStringAttr(ix.name.drop_front()));
+  result.addAttribute("bound", b.getStringAttr(bound.name.drop_front()));
+
+  if (parser.parseKeyword("iter_args") || parser.parseLParen())
+    return failure();
+  SmallVector<Attribute> names;
+  SmallVector<int64_t> inits;
+  SmallVector<OpAsmParser::UnresolvedOperand> iterOperands;
+  do {
+    OpAsmParser::UnresolvedOperand v;
+    int64_t init;
+    if (parser.parseOperand(v, /*allowResultNumber=*/false) ||
+        parser.parseEqual() || parser.parseInteger(init))
+      return failure();
+    iterOperands.push_back(v);
+    names.push_back(b.getStringAttr(v.name.drop_front()));
+    inits.push_back(init);
+  } while (succeeded(parser.parseOptionalComma()));
+  if (parser.parseRParen())
+    return failure();
+  result.addAttribute("iter_names", b.getArrayAttr(names));
+  result.addAttribute("iter_inits", b.getDenseI64ArrayAttr(inits));
+
+  // Body block: (%i, %s, %ph, ...) all !patina.u32, named from the syntax.
+  Type u32 = U32Type::get(b.getContext());
+  SmallVector<OpAsmParser::Argument> regionArgs;
+  OpAsmParser::Argument iArg;
+  iArg.ssaName = ix;
+  iArg.type = u32;
+  regionArgs.push_back(iArg);
+  for (auto &v : iterOperands) {
+    OpAsmParser::Argument arg;
+    arg.ssaName = v;
+    arg.type = u32;
+    regionArgs.push_back(arg);
+  }
+  return parser.parseRegion(*result.addRegion(), regionArgs,
+                            /*enableNameShadowing=*/true);
+}
+
+void ForOp::print(OpAsmPrinter &p) {
+  p << " ";
+  printNameRef(p, getIndexName());
+  p << " = 0 to ";
+  printNameRef(p, getBound());
+  p << " iter_args(";
+  ArrayAttr names = getIterNames();
+  auto inits = getIterInits();
+  for (size_t i = 0; i < names.size(); ++i) {
+    if (i)
+      p << ", ";
+    printNameRef(p, cast<StringAttr>(names[i]).getValue());
+    p << " = " << inits[i];
+  }
+  p << ") ";
+  p.printRegion(getBody(), /*printEntryBlockArgs=*/false,
+                /*printBlockTerminators=*/false);
+}
+
+void ForOp::getAsmBlockArgumentNames(Region &region,
+                                     OpAsmSetValueNameFn setName) {
+  ArrayAttr names = getIterNames();
+  for (auto [i, arg] : llvm::enumerate(region.front().getArguments())) {
+    if (i == 0)
+      setName(arg, getIndexName());
+    else if (i - 1 < names.size())
+      setName(arg, cast<StringAttr>(names[i - 1]).getValue());
+  }
+}
+
+ParseResult YieldOp::parse(OpAsmParser &parser, OperationState &result) {
+  Builder &b = parser.getBuilder();
+  SmallVector<Attribute> vals;
+  do {
+    OpAsmParser::UnresolvedOperand v;
+    if (parser.parseOperand(v, /*allowResultNumber=*/false))
+      return failure();
+    vals.push_back(b.getStringAttr(v.name.drop_front()));
+  } while (succeeded(parser.parseOptionalComma()));
+  result.addAttribute("values", b.getArrayAttr(vals));
+  return success();
+}
+
+void YieldOp::print(OpAsmPrinter &p) {
+  p << " ";
+  llvm::interleaveComma(getValues(), p, [&](Attribute a) {
+    printNameRef(p, cast<StringAttr>(a).getValue());
+  });
+}
+
+LogicalResult YieldOp::verify() {
+  auto forOp = getOperation()->getParentOfType<ForOp>();
+  if (!forOp)
+    return emitOpError("patina.yield must be inside a patina.for region");
+  size_t want = forOp.getIterNames().size();
+  if (getValues().size() != want)
+    return emitOpError("patina.yield operand count (")
+           << getValues().size() << ") does not match patina.for iter_args ("
+           << want << ")";
+  return success();
+}
+
+ParseResult MuliOp::parse(OpAsmParser &parser, OperationState &result) {
+  int32_t k;
+  if (parseNameRef(parser, result, "x") || parser.parseComma() ||
+      parser.parseInteger(k))
+    return failure();
+  result.addAttribute("k", parser.getBuilder().getI32IntegerAttr(k));
+  result.addTypes(U32Type::get(parser.getContext()));
+  captureResultName(parser, result);
+  return success();
+}
+
+void MuliOp::print(OpAsmPrinter &p) {
+  p << " ";
+  printNameRef(p, getX());
+  p << ", " << getK();
+}
+
+void MuliOp::getAsmResultNames(OpAsmSetValueNameFn setName) {
+  if (!getValueName().empty())
+    setName(getResult(), getValueName());
+}
+
+ParseResult NezOp::parse(OpAsmParser &parser, OperationState &result) {
+  if (parseNameRef(parser, result, "x"))
+    return failure();
+  result.addTypes(U32Type::get(parser.getContext()));
+  captureResultName(parser, result);
+  return success();
+}
+
+void NezOp::print(OpAsmPrinter &p) {
+  p << " ";
+  printNameRef(p, getX());
+}
+
+void NezOp::getAsmResultNames(OpAsmSetValueNameFn setName) {
+  if (!getValueName().empty())
+    setName(getResult(), getValueName());
+}
+
+//===----------------------------------------------------------------------===//
 // CTA-scope resources
 //===----------------------------------------------------------------------===//
 
+ParseResult PipelineCreateOp::parse(OpAsmParser &parser,
+                                    OperationState &result) {
+  int32_t stages;
+  Type ty;
+  if (parser.parseKeyword("stages") || parser.parseEqual() ||
+      parser.parseInteger(stages) || parser.parseColon() ||
+      parser.parseType(ty))
+    return failure();
+  result.addAttribute("stages", parser.getBuilder().getI32IntegerAttr(stages));
+  result.addTypes(ty);
+  captureResultName(parser, result);
+  return success();
+}
+
+void PipelineCreateOp::print(OpAsmPrinter &p) {
+  p << " stages = " << getStages() << " : " << getResult().getType();
+}
+
+void PipelineCreateOp::getAsmResultNames(OpAsmSetValueNameFn setName) {
+  if (!getValueName().empty())
+    setName(getResult(), getValueName());
+}
+
 ParseResult SmemAllocOp::parse(OpAsmParser &parser, OperationState &result) {
+  // Optional `stages = S`: a staged (pipelined) buffer of S tiles.
+  if (succeeded(parser.parseOptionalKeyword("stages"))) {
+    int32_t stages;
+    if (parser.parseEqual() || parser.parseInteger(stages))
+      return failure();
+    result.addAttribute("stages",
+                        parser.getBuilder().getI32IntegerAttr(stages));
+  }
   Type ty;
   if (parser.parseColon() || parser.parseType(ty))
     return failure();
@@ -246,12 +440,53 @@ ParseResult SmemAllocOp::parse(OpAsmParser &parser, OperationState &result) {
 }
 
 void SmemAllocOp::print(OpAsmPrinter &p) {
+  if (auto stages = getStagesAttr())
+    p << " stages = " << stages.getInt();
   p << " : " << getResult().getType();
 }
 
 void SmemAllocOp::getAsmResultNames(OpAsmSetValueNameFn setName) {
   if (!getValueName().empty())
     setName(getResult(), getValueName());
+}
+
+ParseResult StageBufOp::parse(OpAsmParser &parser, OperationState &result) {
+  Type ty;
+  if (parseNameRef(parser, result, "base") || parser.parseComma() ||
+      parseNameRef(parser, result, "stage") || parser.parseColon() ||
+      parser.parseType(ty))
+    return failure();
+  result.addTypes(ty);
+  captureResultName(parser, result);
+  return success();
+}
+
+void StageBufOp::print(OpAsmPrinter &p) {
+  p << " ";
+  printNameRef(p, getBase());
+  p << ", ";
+  printNameRef(p, getStage());
+  p << " : " << getResult().getType();
+}
+
+void StageBufOp::getAsmResultNames(OpAsmSetValueNameFn setName) {
+  if (!getValueName().empty())
+    setName(getResult(), getValueName());
+}
+
+LogicalResult StageBufOp::verify() {
+  auto kernel = getOperation()->getParentOfType<KernelOp>();
+  if (!kernel)
+    return success();
+  auto alloc = dyn_cast_or_null<SmemAllocOp>(findDefByName(kernel, getBase()));
+  int64_t stages = 1;
+  if (alloc)
+    if (auto s = alloc.getStagesAttr())
+      stages = s.getInt();
+  if (!alloc || stages <= 1)
+    return emitOpError(
+        "patina.stage_buf requires a staged smem_alloc (stages > 1)");
+  return success();
 }
 
 ParseResult MBarrierCreateOp::parse(OpAsmParser &parser, OperationState &result) {
@@ -356,6 +591,8 @@ LogicalResult ExpectTxOp::verify() {
   uint64_t sum = 0;
   LogicalResult resolved = success();
   kernel.walk([&](TmaLoadOp load) {
+    if (load.getCompleteKindAttr())
+      return; // staged completion: checked by ExpectTxStageOp
     if (load.getComplete() != getBarrier())
       return;
     auto ty = dyn_cast_or_null<patina::TensorType>(
@@ -376,27 +613,102 @@ LogicalResult ExpectTxOp::verify() {
   return success();
 }
 
+ParseResult ExpectTxStageOp::parse(OpAsmParser &parser,
+                                   OperationState &result) {
+  int64_t bytes;
+  if (parseNameRef(parser, result, "pipe") || parser.parseComma())
+    return failure();
+  StringRef kind;
+  if (parser.parseKeyword(&kind))
+    return failure();
+  result.addAttribute("kind", parser.getBuilder().getStringAttr(kind));
+  if (parser.parseComma() || parseNameRef(parser, result, "stage") ||
+      parser.parseComma() || parser.parseInteger(bytes))
+    return failure();
+  result.addAttribute("bytes", parser.getBuilder().getI64IntegerAttr(bytes));
+  return success();
+}
+
+void ExpectTxStageOp::print(OpAsmPrinter &p) {
+  p << " ";
+  printNameRef(p, getPipe());
+  p << ", " << getKind() << ", ";
+  printNameRef(p, getStage());
+  p << ", " << getBytes();
+}
+
+LogicalResult ExpectTxStageOp::verify() {
+  auto kernel = getOperation()->getParentOfType<KernelOp>();
+  if (!kernel)
+    return success();
+  uint64_t sum = 0;
+  LogicalResult resolved = success();
+  kernel.walk([&](TmaLoadOp load) {
+    auto kindAttr = load.getCompleteKindAttr();
+    if (!kindAttr)
+      return; // standalone-barrier completion: checked by ExpectTxOp
+    if (load.getComplete() != getPipe() ||
+        kindAttr.getValue() != getKind())
+      return;
+    auto ty = dyn_cast_or_null<patina::TensorType>(
+        resolveValueType(kernel, load.getDst()));
+    if (!ty) {
+      resolved = emitOpError("cannot resolve type of tma_load destination '%")
+                 << load.getDst() << "'";
+      return;
+    }
+    sum += tensorBytes(ty);
+  });
+  if (failed(resolved))
+    return failure();
+  if (sum != static_cast<uint64_t>(getBytes()))
+    return emitOpError("expect_tx_stage bytes (")
+           << getBytes()
+           << ") != sum of tma_load bytes on this stage barrier (" << sum
+           << ")";
+  return success();
+}
+
 ParseResult TmaLoadOp::parse(OpAsmParser &parser, OperationState &result) {
+  Builder &b = parser.getBuilder();
   if (parseNameRef(parser, result, "map") || parser.parseArrow() ||
       parseNameRef(parser, result, "dst") || parser.parseComma() ||
       parser.parseKeyword("coords") || parser.parseLSquare())
     return failure();
-  SmallVector<int64_t> coords;
+  // Coordinates: integers (compile-time) or %name (runtime scalar).
+  SmallVector<Attribute> coords;
   if (failed(parser.parseOptionalRSquare())) {
     do {
       int64_t c;
-      if (parser.parseInteger(c))
-        return failure();
-      coords.push_back(c);
+      OptionalParseResult parsed = parser.parseOptionalInteger(c);
+      if (parsed.has_value()) {
+        if (failed(*parsed))
+          return failure();
+        coords.push_back(b.getI64IntegerAttr(c));
+      } else {
+        OpAsmParser::UnresolvedOperand ref;
+        if (parser.parseOperand(ref, /*allowResultNumber=*/false))
+          return failure();
+        coords.push_back(b.getStringAttr(ref.name.drop_front()));
+      }
     } while (succeeded(parser.parseOptionalComma()));
     if (parser.parseRSquare())
       return failure();
   }
-  result.addAttribute("coords",
-                      parser.getBuilder().getDenseI64ArrayAttr(coords));
+  result.addAttribute("coords", b.getArrayAttr(coords));
   if (parser.parseComma() || parser.parseKeyword("complete") ||
       parseNameRef(parser, result, "complete"))
     return failure();
+  // Optional staged completion: `complete %pipe, full, %s`.
+  if (succeeded(parser.parseOptionalComma())) {
+    StringRef kind;
+    if (parser.parseKeyword(&kind))
+      return failure();
+    result.addAttribute("complete_kind", b.getStringAttr(kind));
+    if (parser.parseComma() ||
+        parseNameRef(parser, result, "complete_stage"))
+      return failure();
+  }
   return success();
 }
 
@@ -406,9 +718,18 @@ void TmaLoadOp::print(OpAsmPrinter &p) {
   p << " -> ";
   printNameRef(p, getDst());
   p << ", coords [";
-  llvm::interleaveComma(getCoords(), p);
+  llvm::interleaveComma(getCoords(), p, [&](Attribute c) {
+    if (auto name = dyn_cast<StringAttr>(c))
+      p << "%" << name.getValue();
+    else
+      p << cast<IntegerAttr>(c).getInt();
+  });
   p << "], complete ";
   printNameRef(p, getComplete());
+  if (auto kind = getCompleteKindAttr()) {
+    p << ", " << kind.getValue() << ", ";
+    printNameRef(p, getCompleteStageAttr().getValue());
+  }
 }
 
 ParseResult WaitOp::parse(OpAsmParser &parser, OperationState &result) {
@@ -442,6 +763,72 @@ LogicalResult WaitOp::verify() {
            << getPhase() << " waited before phase " << (maxPrior + 1)
            << " on this barrier";
   return success();
+}
+
+ParseResult WaitStageOp::parse(OpAsmParser &parser, OperationState &result) {
+  if (parseNameRef(parser, result, "pipe") || parser.parseComma())
+    return failure();
+  StringRef kind;
+  if (parser.parseKeyword(&kind))
+    return failure();
+  result.addAttribute("kind", parser.getBuilder().getStringAttr(kind));
+  if (parser.parseComma() || parseNameRef(parser, result, "stage") ||
+      parser.parseComma() || parseNameRef(parser, result, "phase"))
+    return failure();
+  return success();
+}
+
+void WaitStageOp::print(OpAsmPrinter &p) {
+  p << " ";
+  printNameRef(p, getPipe());
+  p << ", " << getKind() << ", ";
+  printNameRef(p, getStage());
+  p << ", ";
+  printNameRef(p, getPhase());
+}
+
+LogicalResult WaitStageOp::verify() {
+  // Producer waits `empty` (load role), consumer waits `full` (mma role).
+  auto role = getOperation()->getParentOfType<RoleOp>();
+  StringRef kind = getKind();
+  StringRef need = kind == "empty" ? "load" : "mma";
+  StringRef have = role ? stringifyRoleKind(role.getKind()) : "";
+  if (have != need)
+    return emitOpError()
+           << "'patina.wait_stage' on '" << kind
+           << "' barriers is only legal in a '" << need << "' role region";
+  return success();
+}
+
+ParseResult StageNextOp::parse(OpAsmParser &parser, OperationState &result) {
+  Builder &b = parser.getBuilder();
+  if (parseNameRef(parser, result, "s") || parser.parseComma() ||
+      parseNameRef(parser, result, "ph") || parser.parseKeyword("of") ||
+      parseNameRef(parser, result, "pipe"))
+    return failure();
+  Type u32 = U32Type::get(b.getContext());
+  result.addTypes({u32, u32});
+  result.addAttribute("stage_name",
+                      b.getStringAttr(parser.getResultName(0).first));
+  result.addAttribute("phase_name",
+                      b.getStringAttr(parser.getResultName(1).first));
+  return success();
+}
+
+void StageNextOp::print(OpAsmPrinter &p) {
+  p << " ";
+  printNameRef(p, getS());
+  p << ", ";
+  printNameRef(p, getPh());
+  p << " of ";
+  printNameRef(p, getPipe());
+}
+
+void StageNextOp::getAsmResultNames(OpAsmSetValueNameFn setName) {
+  if (!getStageName().empty())
+    setName(getNextStage(), getStageName());
+  if (!getPhaseName().empty())
+    setName(getNextPhase(), getPhaseName());
 }
 
 //===----------------------------------------------------------------------===//
@@ -485,13 +872,26 @@ LogicalResult UmmaBeginOp::verify() { return verifyInMmaRole(*this); }
 ParseResult UmmaStepOp::parse(OpAsmParser &parser, OperationState &result) {
   if (parseNameRef(parser, result, "m"))
     return failure();
+  if (succeeded(parser.parseOptionalComma())) {
+    // Dynamic scaleC: `patina.umma.step %m, accum %cond`.
+    if (parser.parseKeyword("accum") ||
+        parseNameRef(parser, result, "accum_ref"))
+      return failure();
+    result.addAttribute("accum", parser.getBuilder().getBoolAttr(false));
+    return success();
+  }
   return parser.parseOptionalAttrDict(result.attributes);
 }
 
 void UmmaStepOp::print(OpAsmPrinter &p) {
   p << " ";
   printNameRef(p, getM());
-  p << " {accum = " << (getAccum() ? "true" : "false") << "}";
+  if (auto ref = getAccumRefAttr(); ref && !ref.getValue().empty()) {
+    p << ", accum ";
+    printNameRef(p, ref.getValue());
+  } else {
+    p << " {accum = " << (getAccum() ? "true" : "false") << "}";
+  }
 }
 
 LogicalResult UmmaStepOp::verify() { return verifyInMmaRole(*this); }
@@ -517,6 +917,17 @@ ParseResult UmmaCommitOp::parse(OpAsmParser &parser, OperationState &result) {
   if (parseNameRef(parser, result, "m") || parser.parseArrow() ||
       parseNameRef(parser, result, "barrier"))
     return failure();
+  // Optional staged target: `-> %pipe, empty, %s`.
+  if (succeeded(parser.parseOptionalComma())) {
+    StringRef kind;
+    if (parser.parseKeyword(&kind))
+      return failure();
+    result.addAttribute("barrier_kind",
+                        parser.getBuilder().getStringAttr(kind));
+    if (parser.parseComma() ||
+        parseNameRef(parser, result, "barrier_stage"))
+      return failure();
+  }
   return success();
 }
 
@@ -525,6 +936,10 @@ void UmmaCommitOp::print(OpAsmPrinter &p) {
   printNameRef(p, getM());
   p << " -> ";
   printNameRef(p, getBarrier());
+  if (auto kind = getBarrierKindAttr()) {
+    p << ", " << kind.getValue() << ", ";
+    printNameRef(p, getBarrierStageAttr().getValue());
+  }
 }
 
 LogicalResult UmmaCommitOp::verify() { return verifyInMmaRole(*this); }

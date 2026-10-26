@@ -70,4 +70,18 @@ def Patina_UmmaType : Patina_Type<"Umma", "umma"> {
   let summary = "in-flight UMMA begin/step/advance_k/commit chain";
 }
 
+// Runtime 32-bit unsigned scalar (k_tiles, loop index, stage, phase):
+// `!patina.u32`. Ring pipelines carry phases as VALUES of this type
+// (PROPOSAL open question 2, resolved in M3).
+def Patina_U32Type : Patina_Type<"U32", "u32"> {
+  let summary = "runtime 32-bit unsigned scalar value";
+}
+
+// S-stage smem ring pipeline (full[S] + empty[S] mbarrier arrays):
+// `!patina.pipeline<4>`.
+def Patina_PipelineType : Patina_Type<"Pipeline", "pipeline"> {
+  let summary = "S-stage ring pipeline: full[S] + empty[S] mbarrier arrays";
+  let parameters = (ins "uint32_t":$stages);
+}
+
 #endif // PATINA_TYPES_TD

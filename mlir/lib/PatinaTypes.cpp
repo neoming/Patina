@@ -134,3 +134,23 @@ Type UmmaType::parse(AsmParser &parser) {
 }
 
 void UmmaType::print(AsmPrinter &printer) const {}
+
+Type U32Type::parse(AsmParser &parser) {
+  // Parameterless: `!patina.u32`.
+  return U32Type::get(parser.getContext());
+}
+
+void U32Type::print(AsmPrinter &printer) const {}
+
+Type PipelineType::parse(AsmParser &parser) {
+  if (parser.parseLess())
+    return Type();
+  uint32_t stages;
+  if (parser.parseInteger(stages) || parser.parseGreater())
+    return Type();
+  return PipelineType::get(parser.getContext(), stages);
+}
+
+void PipelineType::print(AsmPrinter &printer) const {
+  printer << "<" << getStages() << ">";
+}
