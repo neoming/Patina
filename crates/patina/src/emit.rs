@@ -3,15 +3,22 @@
 //! The printer emits no comments of its own; blank-line structure and
 //! result-name alignment follow the trace (see `Op::Blank` and `Op::group`).
 
-use crate::trace::{Op, Trace, VERSION};
+use crate::trace::{AccumOp, CoordElem, Op, StageTarget, Trace, VERSION};
 
-fn result_name(op: &Op) -> Option<&str> {
+/// The printed result text of an op (`%m`, or `%s1, %ph1` for the
+/// two-result `patina.stage_next`).
+fn result_name(op: &Op) -> Option<String> {
     match op {
-        Op::SmemAlloc { res, .. }
+        Op::PipelineCreate { res, .. }
+        | Op::SmemAlloc { res, .. }
         | Op::MBarrierCreate { res, .. }
         | Op::TmemAlloc { res, .. }
         | Op::UmmaBegin { res, .. }
-        | Op::TmemLd { res, .. } => Some(res),
+        | Op::TmemLd { res, .. }
+        | Op::StageBuf { res, .. }
+        | Op::Muli { res, .. }
+        | Op::Nez { res, .. } => Some(res.clone()),
+        Op::StageNext { res_s, res_ph, .. } => Some(format!("{}, {}", res_s, res_ph)),
         _ => None,
     }
 }
@@ -45,6 +52,24 @@ fn run_widths(ops: &[Op]) -> Vec<usize> {
     }
     flush(&mut run, &mut widths);
     widths
+}
+
+fn coord_elems(coords: &[CoordElem]) -> String {
+    coords
+        .iter()
+        .map(|c| match c {
+            CoordElem::Const(v) => v.to_string(),
+            CoordElem::Dyn(name) => name.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn stage_target(t: &StageTarget) -> String {
+    match t {
+        StageTarget::Bar(bar) => bar.clone(),
+        StageTarget::Stage { pipe, kind, s } => format!("{}, {}, {}", pipe, kind.mlir(), s),
+    }
 }
 
 pub(crate) fn emit(tr: &Trace) -> String {
@@ -97,7 +122,7 @@ pub(crate) fn emit(tr: &Trace) -> String {
         let widths = run_widths(&tr.ops);
         let mut depth = 1usize;
         for (i, op) in tr.ops.iter().enumerate() {
-            if matches!(op, Op::RoleEnd | Op::WarpSpecializeEnd) {
+            if matches!(op, Op::RoleEnd | Op::WarpSpecializeEnd | Op::ForEnd) {
                 depth -= 1;
             }
             if matches!(op, Op::Blank) {
@@ -107,13 +132,31 @@ pub(crate) fn emit(tr: &Trace) -> String {
             let indent = "  ".repeat(depth);
             let line = match op {
                 Op::Blank => unreachable!(),
-                Op::SmemAlloc { res, ty } => format!(
-                    "{}{:<w$} = patina.smem_alloc : {}",
+                Op::PipelineCreate { res, stages, ty } => format!(
+                    "{}{:<w$} = patina.pipeline.create stages = {} : {}",
                     indent,
                     res,
+                    stages,
                     ty,
                     w = widths[i]
                 ),
+                Op::SmemAlloc { res, stages, ty } => match stages {
+                    Some(s) => format!(
+                        "{}{:<w$} = patina.smem_alloc stages = {} : {}",
+                        indent,
+                        res,
+                        s,
+                        ty,
+                        w = widths[i]
+                    ),
+                    None => format!(
+                        "{}{:<w$} = patina.smem_alloc : {}",
+                        indent,
+                        res,
+                        ty,
+                        w = widths[i]
+                    ),
+                },
                 Op::MBarrierCreate { res, arrivals, ty } => format!(
                     "{}{:<w$} = patina.mbarrier.create arrivals = {} : {}",
                     indent,
@@ -132,7 +175,78 @@ pub(crate) fn emit(tr: &Trace) -> String {
                 ),
                 Op::WarpSpecializeBegin => format!("{}patina.warp_specialize {{", indent),
                 Op::RoleBegin(name) => format!("{}patina.role {} {{", indent, name),
-                Op::RoleEnd | Op::WarpSpecializeEnd => format!("{}}}", indent),
+                Op::RoleEnd | Op::WarpSpecializeEnd | Op::ForEnd => format!("{}}}", indent),
+                Op::ForBegin {
+                    i: ix,
+                    bound,
+                    s,
+                    ph,
+                    init_ph,
+                } => format!(
+                    "{}patina.for {} = 0 to {} iter_args({} = 0, {} = {}) {{",
+                    indent, ix, bound, s, ph, init_ph
+                ),
+                Op::Yield { vals } => format!("{}patina.yield {}", indent, vals.join(", ")),
+                Op::WaitStage { pipe, kind, s, ph } => format!(
+                    "{}patina.wait_stage {}, {}, {}, {}",
+                    indent,
+                    pipe,
+                    kind.mlir(),
+                    s,
+                    ph
+                ),
+                Op::ExpectTxStage {
+                    pipe,
+                    kind,
+                    s,
+                    bytes,
+                } => format!(
+                    "{}patina.expect_tx_stage {}, {}, {}, {}",
+                    indent,
+                    pipe,
+                    kind.mlir(),
+                    s,
+                    bytes
+                ),
+                Op::StageBuf { res, base, s, ty } => format!(
+                    "{}{:<w$} = patina.stage_buf {}, {} : {}",
+                    indent,
+                    res,
+                    base,
+                    s,
+                    ty,
+                    w = widths[i]
+                ),
+                Op::StageNext {
+                    res_s,
+                    res_ph,
+                    s,
+                    ph,
+                    pipe,
+                } => format!(
+                    "{}{:<w$} = patina.stage_next {}, {} of {}",
+                    indent,
+                    format!("{}, {}", res_s, res_ph),
+                    s,
+                    ph,
+                    pipe,
+                    w = widths[i]
+                ),
+                Op::Muli { res, x, k } => format!(
+                    "{}{:<w$} = patina.muli {}, {}",
+                    indent,
+                    res,
+                    x,
+                    k,
+                    w = widths[i]
+                ),
+                Op::Nez { res, x } => format!(
+                    "{}{:<w$} = patina.nez {}",
+                    indent,
+                    res,
+                    x,
+                    w = widths[i]
+                ),
                 Op::ExpectTx { bar, bytes } => {
                     format!("{}patina.expect_tx {}, {}", indent, bar, bytes)
                 }
@@ -140,16 +254,15 @@ pub(crate) fn emit(tr: &Trace) -> String {
                     map,
                     dst,
                     coords,
-                    bar,
+                    complete,
                 } => {
-                    let cs = coords
-                        .iter()
-                        .map(|c| c.to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ");
                     format!(
                         "{}patina.tma_load {} -> {}, coords [{}], complete {}",
-                        indent, map, dst, cs, bar
+                        indent,
+                        map,
+                        dst,
+                        coord_elems(coords),
+                        stage_target(complete)
                     )
                 }
                 Op::Wait { bar, phase } => {
@@ -164,14 +277,22 @@ pub(crate) fn emit(tr: &Trace) -> String {
                     b,
                     w = widths[i]
                 ),
-                Op::UmmaStep { m, accum } => {
-                    format!("{}patina.umma.step {} {{accum = {}}}", indent, m, accum)
-                }
+                Op::UmmaStep { m, accum } => match accum {
+                    AccumOp::Static(b) => {
+                        format!("{}patina.umma.step {} {{accum = {}}}", indent, m, b)
+                    }
+                    AccumOp::Dyn(c) => format!("{}patina.umma.step {}, accum {}", indent, m, c),
+                },
                 Op::UmmaAdvanceK { m, k } => {
                     format!("{}patina.umma.advance_k {}, {}", indent, m, k)
                 }
-                Op::UmmaCommit { m, bar } => {
-                    format!("{}patina.umma.commit {} -> {}", indent, m, bar)
+                Op::UmmaCommit { m, target } => {
+                    format!(
+                        "{}patina.umma.commit {} -> {}",
+                        indent,
+                        m,
+                        stage_target(target)
+                    )
                 }
                 Op::TmemLd { res, acc, ty } => format!(
                     "{}{:<w$} = patina.tmem_ld {} : {}",
@@ -184,7 +305,7 @@ pub(crate) fn emit(tr: &Trace) -> String {
                 Op::Store { ptr, frag } => format!("{}patina.store {}, {}", indent, ptr, frag),
                 Op::TmemDealloc { acc } => format!("{}patina.tmem.dealloc {}", indent, acc),
             };
-            if matches!(op, Op::WarpSpecializeBegin | Op::RoleBegin(_)) {
+            if matches!(op, Op::WarpSpecializeBegin | Op::RoleBegin(_) | Op::ForBegin { .. }) {
                 depth += 1;
             }
             out.push_str(&line);

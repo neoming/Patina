@@ -15,10 +15,10 @@ pub mod prelude {
     pub use crate::{coord, shape};
     pub use crate::layout::{NoSwizzle, Shape, UmmaKMajor};
     pub use crate::trace::{
-        f16, f32, Accum, Arch, BlockCtx, Coord, DType, Epi, EpiWarp, Error, Frag, Kernel,
-        KernelCtx, LaneRow, Load, LoadThread, MBarrier, Mma, MmaThread, Phase, Ptr, Result, Role,
-        RoleOf, RoleSpec, Roles, SmemTensor, Space, TmaMap, Tmem, Umma, WarpSpecialize, Gmem,
-        Smem, phase,
+        f16, f32, Accum, Arch, BlockCtx, Coord, CoordElem, DType, Epi, EpiWarp, Error, Frag,
+        Kernel, KernelCtx, LaneRow, Load, LoadThread, LoopIx, MBarrier, Mma, MmaThread, Phase,
+        PipeStage, Pipeline, Ptr, Result, Role, RoleOf, RoleSpec, Roles, Scalar, SmemTensor,
+        Space, StageBuf, TmaMap, Tmem, Umma, UmmaOperand, Val, WarpSpecialize, Gmem, Smem, phase,
     };
     pub use crate::trace::{FnKernel, KernelArg, KernelArgs, MlirLayout, TraceBuilder,
         RolesBuilder, TracedKernel};

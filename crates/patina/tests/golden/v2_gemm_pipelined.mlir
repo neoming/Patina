@@ -55,7 +55,7 @@ patina.kernel @tcgen05_gemm_v2
         patina.expect_tx_stage %pipe, full, %s, 16384
         %sa_s = patina.stage_buf %sa, %s : !patina.tensor<f16, 128x32, smem, #lay>
         %sb_s = patina.stage_buf %sb, %s : !patina.tensor<f16, 128x32, smem, #lay>
-        %i4 = patina.muli %i, 4
+        %i4   = patina.muli %i, 4
         patina.tma_load %tma_a -> %sa_s, coords [0, 0, %i4, 0], complete %pipe, full, %s
         patina.tma_load %tma_b -> %sb_s, coords [0, 0, %i4, 0], complete %pipe, full, %s
         %s1, %ph1 = patina.stage_next %s, %ph of %pipe
@@ -70,7 +70,7 @@ patina.kernel @tcgen05_gemm_v2
         %sa_s = patina.stage_buf %sa, %s : !patina.tensor<f16, 128x32, smem, #lay>
         %sb_s = patina.stage_buf %sb, %s : !patina.tensor<f16, 128x32, smem, #lay>
         %cont = patina.nez %i
-        %m = patina.umma.begin %acc, %sa_s, %sb_s
+        %m    = patina.umma.begin %acc, %sa_s, %sb_s
         patina.umma.step %m, accum %cont
         patina.umma.advance_k %m, 16
         patina.umma.step %m {accum = true}
@@ -89,5 +89,6 @@ patina.kernel @tcgen05_gemm_v2
       patina.store %c, %frag
     }
   }
+
   patina.tmem.dealloc %acc
 }

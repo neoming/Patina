@@ -1,10 +1,15 @@
-//! Trace IR: the typed builder that user kernels run against (M1b).
+//! Trace IR: the typed builder that user kernels run against (M1b, M3).
 //!
 //! Kernel code is ordinary Rust; every `Val`-like handle carries an IR name
 //! and a reference back to the [`Trace`], so calling a capability method on a
 //! role token appends an op to the IR. Role capability is enforced by the
 //! type system: `tma_load`/`expect_tx` exist only on [`LoadThread`], `umma_*`
 //! only on [`MmaThread`], `tmem_ld`/`store_v4` only on [`EpiWarp`].
+//!
+//! M3 adds the pipelined-mainloop surface: [`Pipeline`] ring buffers, runtime
+//! `for_each` loops with loop-carried [`PipeStage`] (stage index + phase as
+//! `!patina.u32` values), staged TMA/UMMA barrier forms, and scalar ops
+//! ([`LoopIx::muli`], [`LoopIx::nez`]).
 
 use std::any::type_name;
 use std::cell::RefCell;
@@ -115,12 +120,50 @@ impl MlirLayout for UmmaKMajor<NoSwizzle> {
 // IR ops
 // ---------------------------------------------------------------------------
 
+/// Which barrier array of a pipeline a staged synchronization op targets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StageKind {
+    Empty,
+    Full,
+}
+
+impl StageKind {
+    pub(crate) fn mlir(self) -> &'static str {
+        match self {
+            StageKind::Empty => "empty",
+            StageKind::Full => "full",
+        }
+    }
+}
+
+/// Completion target of a staged-capable op (`tma_load`, `umma.commit`):
+/// either a standalone mbarrier (v1) or a `(pipeline, kind, stage)` triple.
+#[derive(Clone, Debug)]
+pub(crate) enum StageTarget {
+    Bar(String),
+    Stage { pipe: String, kind: StageKind, s: String },
+}
+
+/// The scaleC operand of one UMMA K16 step: a compile-time flag (v1) or a
+/// runtime scalar (M3 pipelined mainloop: `i != 0`).
+#[derive(Clone, Debug)]
+pub(crate) enum AccumOp {
+    Static(bool),
+    Dyn(String),
+}
+
 #[derive(Debug)]
 pub(crate) enum Op {
     /// Explicit blank line in the printed dialect.
     Blank,
+    PipelineCreate {
+        res: String,
+        stages: usize,
+        ty: String,
+    },
     SmemAlloc {
         res: String,
+        stages: Option<usize>,
         ty: String,
     },
     MBarrierCreate {
@@ -137,6 +180,51 @@ pub(crate) enum Op {
     RoleBegin(String),
     RoleEnd,
     WarpSpecializeEnd,
+    ForBegin {
+        i: String,
+        bound: String,
+        s: String,
+        ph: String,
+        init_ph: u32,
+    },
+    Yield {
+        vals: Vec<String>,
+    },
+    ForEnd,
+    WaitStage {
+        pipe: String,
+        kind: StageKind,
+        s: String,
+        ph: String,
+    },
+    ExpectTxStage {
+        pipe: String,
+        kind: StageKind,
+        s: String,
+        bytes: u64,
+    },
+    StageBuf {
+        res: String,
+        base: String,
+        s: String,
+        ty: String,
+    },
+    StageNext {
+        res_s: String,
+        res_ph: String,
+        s: String,
+        ph: String,
+        pipe: String,
+    },
+    Muli {
+        res: String,
+        x: String,
+        k: u32,
+    },
+    Nez {
+        res: String,
+        x: String,
+    },
     ExpectTx {
         bar: String,
         bytes: u64,
@@ -144,8 +232,8 @@ pub(crate) enum Op {
     TmaLoad {
         map: String,
         dst: String,
-        coords: Vec<u64>,
-        bar: String,
+        coords: Vec<CoordElem>,
+        complete: StageTarget,
     },
     Wait {
         bar: String,
@@ -159,7 +247,7 @@ pub(crate) enum Op {
     },
     UmmaStep {
         m: String,
-        accum: bool,
+        accum: AccumOp,
     },
     UmmaAdvanceK {
         m: String,
@@ -167,7 +255,7 @@ pub(crate) enum Op {
     },
     UmmaCommit {
         m: String,
-        bar: String,
+        target: StageTarget,
     },
     TmemLd {
         res: String,
@@ -189,11 +277,12 @@ impl Op {
     /// markers share group 0 and manage their blanks explicitly.
     fn group(&self) -> u8 {
         match self {
-            Op::SmemAlloc { .. } => 1,
-            Op::MBarrierCreate { .. } => 2,
-            Op::TmemAlloc { .. } => 3,
-            Op::WarpSpecializeBegin => 4,
-            Op::TmemDealloc { .. } => 5,
+            Op::PipelineCreate { .. } => 1,
+            Op::SmemAlloc { .. } => 2,
+            Op::MBarrierCreate { .. } => 3,
+            Op::TmemAlloc { .. } => 4,
+            Op::WarpSpecializeBegin => 5,
+            Op::TmemDealloc { .. } => 6,
             _ => 0,
         }
     }
@@ -220,6 +309,10 @@ pub struct Trace {
     tmem_n: usize,
     umma_n: usize,
     frag_n: usize,
+    pipe_n: usize,
+    cont_n: usize,
+    /// Name of the most recently begun UMMA chain (for `commit_tail`).
+    last_umma: Option<String>,
     param_n: std::collections::HashMap<&'static str, usize>,
 }
 
@@ -238,6 +331,9 @@ impl Trace {
             tmem_n: 0,
             umma_n: 0,
             frag_n: 0,
+            pipe_n: 0,
+            cont_n: 0,
+            last_umma: None,
             param_n: std::collections::HashMap::new(),
         }
     }
@@ -303,6 +399,26 @@ impl Trace {
         }
     }
 
+    fn next_pipe(&mut self) -> String {
+        let n = self.pipe_n;
+        self.pipe_n += 1;
+        if n == 0 {
+            "%pipe".to_string()
+        } else {
+            format!("%pipe{}", n)
+        }
+    }
+
+    fn next_cont(&mut self) -> String {
+        let n = self.cont_n;
+        self.cont_n += 1;
+        if n == 0 {
+            "%cont".to_string()
+        } else {
+            format!("%cont{}", n)
+        }
+    }
+
     fn param_count(&mut self, base: &'static str) -> usize {
         let n = *self.param_n.get(base).unwrap_or(&0);
         self.param_n.insert(base, n + 1);
@@ -314,22 +430,50 @@ impl Trace {
 // Value handles
 // ---------------------------------------------------------------------------
 
-/// Coordinate literal: `coord![0, 0, 0, 0]`.
+/// Coordinate list: `coord![0, 0, 0, 0]`, optionally with runtime scalars
+/// (`coord![0, 0, i4, 0]` where `i4` comes from [`LoopIx::muli`]).
 #[macro_export]
 macro_rules! coord {
     ($($c:expr),+ $(,)?) => {
-        $crate::trace::Coord::from(vec![$($c as u64),+])
+        $crate::trace::Coord::from_elems(vec![
+            $($crate::trace::CoordElem::from(($c).clone())),+
+        ])
     };
 }
 pub use crate::coord;
 
+/// One TMA coordinate: a compile-time constant or a runtime scalar value.
+#[derive(Clone, Debug)]
+pub enum CoordElem {
+    Const(u64),
+    Dyn(String),
+}
+
+impl From<i32> for CoordElem {
+    fn from(v: i32) -> Self {
+        CoordElem::Const(v as u64)
+    }
+}
+
+impl From<Scalar> for CoordElem {
+    fn from(v: Scalar) -> Self {
+        CoordElem::Dyn(v.name)
+    }
+}
+
 /// TMA copy coordinates (4D for the canonical view).
 #[derive(Clone, Debug)]
-pub struct Coord(pub Vec<u64>);
+pub struct Coord(pub Vec<CoordElem>);
+
+impl Coord {
+    pub fn from_elems(elems: Vec<CoordElem>) -> Self {
+        Coord(elems)
+    }
+}
 
 impl From<Vec<u64>> for Coord {
     fn from(v: Vec<u64>) -> Self {
-        Coord(v)
+        Coord(v.into_iter().map(CoordElem::Const).collect())
     }
 }
 
@@ -346,6 +490,54 @@ pub fn phase(p: u32) -> Phase {
 pub enum Accum {
     No,
     Yes,
+}
+
+/// A runtime `!patina.u32` scalar kernel parameter. Unlike trace-time Rust
+/// values, a `Val` is an IR node: it appears in the kernel signature and can
+/// bound a runtime loop.
+pub struct Val<T> {
+    name: String,
+    _pd: PhantomData<T>,
+}
+
+/// A runtime scalar produced inside the kernel body (by [`LoopIx::muli`] or
+/// [`LoopIx::nez`]); usable in TMA coordinates and as the dynamic UMMA
+/// scaleC operand.
+#[derive(Clone, Debug)]
+pub struct Scalar {
+    name: String,
+}
+
+/// The index of a runtime `patina.for` loop (zero-based, `!patina.u32`).
+pub struct LoopIx {
+    name: String,
+    trace: TraceRef,
+}
+
+impl LoopIx {
+    /// `patina.muli` — runtime multiply by a compile-time constant (e.g. the
+    /// TMA K-coordinate advance per tile).
+    pub fn muli<const K: u32>(&self) -> Scalar {
+        let name = format!("{}{}", self.name, K);
+        self.trace.borrow_mut().push(Op::Muli {
+            res: name.clone(),
+            x: self.name.clone(),
+            k: K,
+        });
+        Scalar { name }
+    }
+
+    /// `patina.nez` — 1 while the index is nonzero; the dynamic scaleC of a
+    /// pipelined mainloop (overwrite on the first tile, accumulate after).
+    pub fn nez(&self) -> Scalar {
+        let mut tr = self.trace.borrow_mut();
+        let name = tr.next_cont();
+        tr.push(Op::Nez {
+            res: name.clone(),
+            x: self.name.clone(),
+        });
+        Scalar { name }
+    }
 }
 
 /// TMA tensor-map kernel parameter (host-encoded, `__grid_constant__`).
@@ -372,17 +564,45 @@ impl<T: DType, S: Space> Add<LaneRow> for Ptr<T, S> {
     }
 }
 
-/// A typed smem tensor; layout is part of the type.
+/// A typed smem tensor; layout is part of the type. Created directly by
+/// [`BlockCtx::smem`] (single buffer) or staged by [`Pipeline::buf`].
 pub struct SmemTensor<T: DType, L: MlirLayout> {
     name: String,
+    ty: String,
     shape: Shape,
+    stages: usize,
     _pd: PhantomData<(T, L)>,
 }
 
 impl<T: DType, L: MlirLayout> SmemTensor<T, L> {
-    /// Byte size of the tile — feeds `expect_tx`.
+    /// Byte size of one tile — feeds `expect_tx`/`publish`.
     pub fn bytes(&self) -> u64 {
         self.shape.elems() * T::BYTES
+    }
+}
+
+/// Anything that can serve as a UMMA smem operand: a plain smem tensor or
+/// one stage of a staged (pipelined) buffer.
+pub trait UmmaOperand {
+    #[doc(hidden)]
+    fn ir_name(&self) -> &str;
+}
+
+impl<T: DType, L: MlirLayout> UmmaOperand for SmemTensor<T, L> {
+    fn ir_name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// The stage-`s` slice of a staged smem buffer (`patina.stage_buf`).
+pub struct StageBuf<T: DType, L: MlirLayout> {
+    name: String,
+    _pd: PhantomData<(T, L)>,
+}
+
+impl<T: DType, L: MlirLayout> UmmaOperand for StageBuf<T, L> {
+    fn ir_name(&self) -> &str {
+        &self.name
     }
 }
 
@@ -399,6 +619,105 @@ impl<const ARRIVALS: usize> MBarrier<ARRIVALS> {
             bar: self.name.clone(),
             phase: p.0,
         });
+    }
+}
+
+/// An `S`-stage smem ring pipeline: owns `full[S]` + `empty[S]` mbarrier
+/// arrays. Phases are runtime values, loop-carried with the stage index in
+/// a [`PipeStage`].
+///
+/// Convention: the producer waits `empty[s]` with initial phase 1 and
+/// publishes `full[s]`; the consumer waits `full[s]` with initial phase 0
+/// and releases `empty[s]`. The phase flips when the stage wraps mod `S`.
+pub struct Pipeline<const S: usize> {
+    name: String,
+    trace: TraceRef,
+}
+
+impl<const S: usize> Pipeline<S> {
+    /// Allocate a staged smem buffer: `S` contiguous tiles of `shape`.
+    pub fn buf<T: DType, L: MlirLayout, Sh: Into<Shape>>(&self, shape: Sh) -> SmemTensor<T, L> {
+        let shape = shape.into();
+        let mut tr = self.trace.borrow_mut();
+        if L::mlir_def().is_some() {
+            tr.lay_alias = true;
+        }
+        let name = tr.next_smem();
+        let ty = format!(
+            "!patina.tensor<{}, {}, {}, {}>",
+            T::MLIR,
+            shape.mlir(),
+            Smem::MLIR,
+            L::mlir_ref()
+        );
+        tr.push_top(Op::SmemAlloc {
+            res: name.clone(),
+            stages: Some(S),
+            ty: ty.clone(),
+        });
+        SmemTensor {
+            name,
+            ty,
+            shape,
+            stages: S,
+            _pd: PhantomData,
+        }
+    }
+
+    /// The stage-`st` slice of a staged buffer (`patina.stage_buf`).
+    pub fn stage_buf<T: DType, L: MlirLayout>(
+        &self,
+        base: &SmemTensor<T, L>,
+        st: &PipeStage,
+    ) -> StageBuf<T, L> {
+        if base.stages <= 1 {
+            panic!(
+                "patina: stage_buf requires a staged buffer (pipeline.buf(...)), got {}",
+                base.name
+            );
+        }
+        let name = format!("{}_s", base.name);
+        self.trace.borrow_mut().push(Op::StageBuf {
+            res: name.clone(),
+            base: base.name.clone(),
+            s: st.s.clone(),
+            ty: base.ty.clone(),
+        });
+        StageBuf {
+            name,
+            _pd: PhantomData,
+        }
+    }
+}
+
+/// Loop-carried pipeline state: the ring stage index and phase parity, both
+/// runtime `!patina.u32` values. Produced by `for_each` and threaded through
+/// the loop body; the closure returns `st.next(pipe)` so the loop can yield
+/// the advanced state.
+pub struct PipeStage {
+    s: String,
+    ph: String,
+    trace: TraceRef,
+}
+
+impl PipeStage {
+    /// Advance the ring: stage +1 mod S, phase flip on wrap
+    /// (`patina.stage_next`).
+    pub fn next<const S: usize>(self, pipe: &Pipeline<S>) -> PipeStage {
+        let res_s = format!("{}1", self.s);
+        let res_ph = format!("{}1", self.ph);
+        self.trace.borrow_mut().push(Op::StageNext {
+            res_s: res_s.clone(),
+            res_ph: res_ph.clone(),
+            s: self.s.clone(),
+            ph: self.ph.clone(),
+            pipe: pipe.name.clone(),
+        });
+        PipeStage {
+            s: res_s,
+            ph: res_ph,
+            trace: Rc::clone(&self.trace),
+        }
     }
 }
 
@@ -430,7 +749,17 @@ impl Umma {
     pub fn step(&mut self, accum: Accum) {
         self.trace.borrow_mut().push(Op::UmmaStep {
             m: self.name.clone(),
-            accum: accum == Accum::Yes,
+            accum: AccumOp::Static(accum == Accum::Yes),
+        });
+    }
+
+    /// One K16 step with a *runtime* scaleC (`accum %cond`); the pipelined
+    /// mainloop passes `i.nez()` so the first tile overwrites and the rest
+    /// accumulate.
+    pub fn step_dyn(&mut self, cond: &Scalar) {
+        self.trace.borrow_mut().push(Op::UmmaStep {
+            m: self.name.clone(),
+            accum: AccumOp::Dyn(cond.name.clone()),
         });
     }
 
@@ -447,7 +776,20 @@ impl Umma {
     pub fn commit<const N: usize>(&mut self, bar: &MBarrier<N>) {
         self.trace.borrow_mut().push(Op::UmmaCommit {
             m: self.name.clone(),
-            bar: bar.name.clone(),
+            target: StageTarget::Bar(bar.name.clone()),
+        });
+    }
+
+    /// `tcgen05.commit` arriving on the pipeline's `empty[s]` barrier —
+    /// releases the consumed stage back to the producer.
+    pub fn commit_stage<const S: usize>(&mut self, pipe: &Pipeline<S>, st: &PipeStage) {
+        self.trace.borrow_mut().push(Op::UmmaCommit {
+            m: self.name.clone(),
+            target: StageTarget::Stage {
+                pipe: pipe.name.clone(),
+                kind: StageKind::Empty,
+                s: st.s.clone(),
+            },
         });
     }
 }
@@ -503,12 +845,31 @@ impl BlockCtx {
         );
         tr.push_top(Op::SmemAlloc {
             res: name.clone(),
-            ty,
+            stages: None,
+            ty: ty.clone(),
         });
         SmemTensor {
             name,
+            ty,
             shape,
+            stages: 1,
             _pd: PhantomData,
+        }
+    }
+
+    /// Create an `S`-stage ring pipeline (full[S] + empty[S] barrier
+    /// arrays, staged smem via [`Pipeline::buf`]).
+    pub fn pipeline<const S: usize>(&self) -> Pipeline<S> {
+        let mut tr = self.trace.borrow_mut();
+        let name = tr.next_pipe();
+        tr.push_top(Op::PipelineCreate {
+            res: name.clone(),
+            stages: S,
+            ty: format!("!patina.pipeline<{}>", S),
+        });
+        Pipeline {
+            name,
+            trace: Rc::clone(&self.trace),
         }
     }
 
@@ -517,6 +878,21 @@ impl BlockCtx {
         let mut tr = self.trace.borrow_mut();
         let name = tr.next_mbar();
         tr.push_top(Op::MBarrierCreate {
+            res: name.clone(),
+            arrivals: N,
+            ty: format!("!patina.mbarrier<{}>", N),
+        });
+        MBarrier {
+            name,
+            trace: Rc::clone(&self.trace),
+        }
+    }
+
+    /// A named mbarrier, for barriers outside the v1 load/mma pair (e.g.
+    /// the pipelined kernel's accumulator-drain barrier `%acc_done`).
+    pub fn mbarrier_named<const N: usize>(&self, name: &str) -> MBarrier<N> {
+        let name = format!("%{}", name);
+        self.trace.borrow_mut().push_top(Op::MBarrierCreate {
             res: name.clone(),
             arrivals: N,
             ty: format!("!patina.mbarrier<{}>", N),
@@ -587,6 +963,41 @@ impl<Rs: Roles> WarpSpecialize<Rs> {
     }
 }
 
+/// Shared implementation of the role-token `for_each`: emits
+/// `patina.for %i = 0 to bound iter_args(%s = 0, %ph = init_ph)`, runs the
+/// body, then yields the advanced stage state returned by the closure.
+/// Loop value names restart per loop (`%i`, `%s`, `%ph`); region-local
+/// shadowing keeps the dialect refs unambiguous.
+fn for_each_impl(
+    trace: &TraceRef,
+    bound: &str,
+    init_ph: u32,
+    f: impl FnOnce(LoopIx, PipeStage) -> PipeStage,
+) {
+    trace.borrow_mut().push(Op::ForBegin {
+        i: "%i".to_string(),
+        bound: bound.to_string(),
+        s: "%s".to_string(),
+        ph: "%ph".to_string(),
+        init_ph,
+    });
+    let i = LoopIx {
+        name: "%i".to_string(),
+        trace: Rc::clone(trace),
+    };
+    let st = PipeStage {
+        s: "%s".to_string(),
+        ph: "%ph".to_string(),
+        trace: Rc::clone(trace),
+    };
+    let st = f(i, st);
+    let mut tr = trace.borrow_mut();
+    tr.push(Op::Yield {
+        vals: vec![st.s, st.ph],
+    });
+    tr.push(Op::ForEnd);
+}
+
 /// Load role token: one elected thread of warp 0. Has `tma_load` +
 /// `expect_tx`; lacks `umma`, `tmem_ld`, `tmem_alloc` (compile error).
 pub struct LoadThread {
@@ -616,7 +1027,59 @@ impl LoadThread {
             map: map.name.clone(),
             dst: dst.name.clone(),
             coords: coords.0,
-            bar: bar.name.clone(),
+            complete: StageTarget::Bar(bar.name.clone()),
+        });
+    }
+
+    /// Runtime loop `for i in 0..bound` emitting `patina.for` with
+    /// loop-carried pipeline state. Producer side: the stage phase starts
+    /// at 1, so the first `empty[s]` acquisitions pass on fresh barriers.
+    pub fn for_each(&self, bound: &Val<u32>, f: impl FnOnce(LoopIx, PipeStage) -> PipeStage) {
+        for_each_impl(&self.trace, &bound.name, 1, f);
+    }
+
+    /// Wait the stage's `empty` barrier with the carried phase
+    /// (`patina.wait_stage pipe, empty, s, ph`).
+    pub fn producer_acquire<const S: usize>(&self, pipe: &Pipeline<S>, st: &PipeStage) {
+        self.trace.borrow_mut().push(Op::WaitStage {
+            pipe: pipe.name.clone(),
+            kind: StageKind::Empty,
+            s: st.s.clone(),
+            ph: st.ph.clone(),
+        });
+    }
+
+    /// Publish the expected transaction bytes on the stage's `full`
+    /// barrier; must equal the sum of the staged `tma_load` bytes on it
+    /// (dialect verifier enforces the match).
+    pub fn publish<const S: usize>(&self, pipe: &Pipeline<S>, st: &PipeStage, bytes: u64) {
+        self.trace.borrow_mut().push(Op::ExpectTxStage {
+            pipe: pipe.name.clone(),
+            kind: StageKind::Full,
+            s: st.s.clone(),
+            bytes,
+        });
+    }
+
+    /// `cp.async.bulk.tensor.4d` into one stage of a staged buffer,
+    /// completing on the pipeline's `full[s]` barrier.
+    pub fn tma_load_stage<T: DType, L: MlirLayout, const S: usize>(
+        &self,
+        map: &TmaMap<T, L>,
+        dst: &StageBuf<T, L>,
+        coords: Coord,
+        pipe: &Pipeline<S>,
+        st: &PipeStage,
+    ) {
+        self.trace.borrow_mut().push(Op::TmaLoad {
+            map: map.name.clone(),
+            dst: dst.name.clone(),
+            coords: coords.0,
+            complete: StageTarget::Stage {
+                pipe: pipe.name.clone(),
+                kind: StageKind::Full,
+                s: st.s.clone(),
+            },
         });
     }
 }
@@ -631,24 +1094,59 @@ impl MmaThread {
     /// Begin a UMMA chain (f16 in, f32 acc, K-major). The instruction
     /// descriptor is packed by lowering from the operand types; the smem
     /// descriptors (LBO/SBO) come from the layout in the tensor types.
-    pub fn umma_f16<const COLS: usize, L: MlirLayout>(
+    /// Operands are plain smem tensors or pipeline stage buffers.
+    pub fn umma_f16<const COLS: usize, A: UmmaOperand, B: UmmaOperand>(
         &self,
         acc: &Tmem<f32, COLS>,
-        a: &SmemTensor<f16, L>,
-        b: &SmemTensor<f16, L>,
+        a: &A,
+        b: &B,
     ) -> Umma {
         let mut tr = self.trace.borrow_mut();
         let name = tr.next_umma();
+        tr.last_umma = Some(name.clone());
         tr.push(Op::UmmaBegin {
             res: name.clone(),
             acc: acc.name.clone(),
-            a: a.name.clone(),
-            b: b.name.clone(),
+            a: a.ir_name().to_string(),
+            b: b.ir_name().to_string(),
         });
         Umma {
             name,
             trace: Rc::clone(&self.trace),
         }
+    }
+
+    /// Runtime loop `for i in 0..bound` emitting `patina.for` with
+    /// loop-carried pipeline state. Consumer side: the stage phase starts
+    /// at 0.
+    pub fn for_each(&self, bound: &Val<u32>, f: impl FnOnce(LoopIx, PipeStage) -> PipeStage) {
+        for_each_impl(&self.trace, &bound.name, 0, f);
+    }
+
+    /// Wait the stage's `full` barrier with the carried phase
+    /// (`patina.wait_stage pipe, full, s, ph`).
+    pub fn consumer_acquire<const S: usize>(&self, pipe: &Pipeline<S>, st: &PipeStage) {
+        self.trace.borrow_mut().push(Op::WaitStage {
+            pipe: pipe.name.clone(),
+            kind: StageKind::Full,
+            s: st.s.clone(),
+            ph: st.ph.clone(),
+        });
+    }
+
+    /// Drain commit on a standalone barrier after the mainloop, referencing
+    /// the most recently begun UMMA chain: the whole MMA group is complete
+    /// once `bar` flips (the epilogue waits it).
+    pub fn commit_tail<const N: usize>(&self, bar: &MBarrier<N>) {
+        let mut tr = self.trace.borrow_mut();
+        let m = tr
+            .last_umma
+            .clone()
+            .expect("patina: commit_tail requires a prior umma chain");
+        tr.push(Op::UmmaCommit {
+            m,
+            target: StageTarget::Bar(bar.name.clone()),
+        });
     }
 }
 
@@ -792,6 +1290,22 @@ impl<T: DType, S: Space> KernelArg for Ptr<T, S> {
         tr.params
             .push((name.clone(), format!("!patina.ptr<{}, {}>", T::MLIR, S::MLIR)));
         Ptr {
+            name,
+            _pd: PhantomData,
+        }
+    }
+}
+
+impl KernelArg for Val<u32> {
+    fn register(tr: &mut Trace) -> Self {
+        let n = tr.param_count("k_tiles");
+        let name = if n == 0 {
+            "%k_tiles".to_string()
+        } else {
+            format!("%k_tiles{}", n)
+        };
+        tr.params.push((name.clone(), "!patina.u32".to_string()));
+        Val {
             name,
             _pd: PhantomData,
         }

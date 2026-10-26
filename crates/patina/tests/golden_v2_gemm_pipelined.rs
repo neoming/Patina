@@ -47,10 +47,10 @@ fn tcgen05_gemm_v2(
         let pipe = blk.pipeline::<4>();
         // Staged smem: S contiguous tiles each; stage slices come from
         // pipe.stage_buf(...) inside the loop.
-        let s_a = pipe.buf::<f16, UmmaKMajor<NoSwizzle>>(shape![128, 32]);
-        let s_b = pipe.buf::<f16, UmmaKMajor<NoSwizzle>>(shape![128, 32]);
+        let s_a = pipe.buf::<f16, UmmaKMajor<NoSwizzle>, _>(shape![128, 32]);
+        let s_b = pipe.buf::<f16, UmmaKMajor<NoSwizzle>, _>(shape![128, 32]);
 
-        let acc_done = blk.mbarrier::<1>();
+        let acc_done = blk.mbarrier_named::<1>("acc_done");
         let acc = blk.tmem_alloc::<f32, 128>()?;
 
         blk.warp_specialize::<GemmRoles>(|ws| {
