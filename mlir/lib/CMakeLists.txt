@@ -12,3 +12,5 @@ add_mlir_dialect_library(PatinaMLIR
   LINK_LIBS PUBLIC
   MLIR
 )
+
+add_subdirectory(capi)

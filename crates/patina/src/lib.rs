@@ -3,6 +3,7 @@
 //! Rust-embedded DSL that traces warp-specialized Blackwell kernels and
 //! emits the Patina MLIR dialect. See `PROPOSAL.md`.
 
+pub mod ffi;
 pub mod layout;
 pub mod testing;
 pub mod trace;
