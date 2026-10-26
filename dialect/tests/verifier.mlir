@@ -113,3 +113,108 @@ patina.kernel @warp_overflow
   }
   patina.tmem.dealloc %acc
 }
+
+// -----
+// valid: compact pipelined mainloop (same shape as the v2 golden kernel)
+// ===========================================================================
+#lay = #patina.umma_k_major<swizzle_none>
+
+patina.kernel @pipe_ok
+    version = 0.1, arch = #patina.arch<sm_100a>, block = 64,
+    roles = [#patina.role<load, 1>, #patina.role<mma, 1>]
+  (%tma_a: !patina.tma_map<f16, #lay>,
+   %k_tiles: !patina.u32) {
+  %pipe = patina.pipeline.create stages = 4 : !patina.pipeline<4>
+  %sa = patina.smem_alloc stages = 4 : !patina.tensor<f16, 128x32, smem, #lay>
+  %acc_done = patina.mbarrier.create arrivals = 1 : !patina.mbarrier<1>
+  %acc = patina.tmem.alloc cols = 128 : !patina.tmem<f32, 128>
+  patina.warp_specialize {
+    patina.role load {
+      patina.for %i = 0 to %k_tiles iter_args(%s = 0, %ph = 1) {
+        patina.wait_stage %pipe, empty, %s, %ph
+        patina.expect_tx_stage %pipe, full, %s, 8192
+        %sa_s = patina.stage_buf %sa, %s : !patina.tensor<f16, 128x32, smem, #lay>
+        patina.tma_load %tma_a -> %sa_s, coords [0, 0, 0, 0], complete %pipe, full, %s
+        %s1, %ph1 = patina.stage_next %s, %ph of %pipe
+        patina.yield %s1, %ph1
+      }
+    }
+    patina.role mma {
+      patina.for %i = 0 to %k_tiles iter_args(%s = 0, %ph = 0) {
+        patina.wait_stage %pipe, full, %s, %ph
+        %sa_s = patina.stage_buf %sa, %s : !patina.tensor<f16, 128x32, smem, #lay>
+        %m = patina.umma.begin %acc, %sa_s, %sa_s
+        patina.umma.step %m {accum = true}
+        patina.umma.commit %m -> %pipe, empty, %s
+        %s1, %ph1 = patina.stage_next %s, %ph of %pipe
+        patina.yield %s1, %ph1
+      }
+      patina.umma.commit %m -> %acc_done
+    }
+  }
+  patina.tmem.dealloc %acc
+}
+
+// -----
+// invalid: producer-side wait (empty) inside the mma role
+// ===========================================================================
+patina.kernel @bad_wait_role
+    version = 0.1, arch = #patina.arch<sm_100a>, block = 64,
+    roles = [#patina.role<load, 1>, #patina.role<mma, 1>]
+  (%k_tiles: !patina.u32) {
+  %pipe = patina.pipeline.create stages = 4 : !patina.pipeline<4>
+  patina.warp_specialize {
+    patina.role load { }
+    patina.role mma {
+      patina.for %i = 0 to %k_tiles iter_args(%s = 0, %ph = 0) {
+        // expected-error @+1 {{'patina.wait_stage' on 'empty' barriers is only legal in a 'load' role region}}
+        patina.wait_stage %pipe, empty, %s, %ph
+        patina.yield %s, %ph
+      }
+    }
+  }
+}
+
+// -----
+// invalid: expect_tx_stage byte count does not match the staged copies
+// ===========================================================================
+#lay = #patina.umma_k_major<swizzle_none>
+
+patina.kernel @bad_tx_stage
+    version = 0.1, arch = #patina.arch<sm_100a>, block = 64,
+    roles = [#patina.role<load, 1>, #patina.role<mma, 1>]
+  (%tma_a: !patina.tma_map<f16, #lay>,
+   %k_tiles: !patina.u32) {
+  %pipe = patina.pipeline.create stages = 4 : !patina.pipeline<4>
+  %sa = patina.smem_alloc stages = 4 : !patina.tensor<f16, 128x32, smem, #lay>
+  patina.warp_specialize {
+    patina.role load {
+      patina.for %i = 0 to %k_tiles iter_args(%s = 0, %ph = 1) {
+        patina.wait_stage %pipe, empty, %s, %ph
+        // expected-error @+1 {{expect_tx_stage bytes (4096) != sum of tma_load bytes on this stage barrier (8192)}}
+        patina.expect_tx_stage %pipe, full, %s, 4096
+        %sa_s = patina.stage_buf %sa, %s : !patina.tensor<f16, 128x32, smem, #lay>
+        patina.tma_load %tma_a -> %sa_s, coords [0, 0, 0, 0], complete %pipe, full, %s
+        patina.yield %s, %ph
+      }
+    }
+    patina.role mma { }
+  }
+}
+
+// -----
+// invalid: patina.yield must yield exactly the iter_args of the enclosing for
+// ===========================================================================
+patina.kernel @bad_yield
+    version = 0.1, arch = #patina.arch<sm_100a>, block = 32,
+    roles = [#patina.role<mma, 1>]
+  (%k_tiles: !patina.u32) {
+  patina.warp_specialize {
+    patina.role mma {
+      patina.for %i = 0 to %k_tiles iter_args(%s = 0, %ph = 0) {
+        // expected-error @+1 {{patina.yield operand count (1) does not match patina.for iter_args (2)}}
+        patina.yield %s
+      }
+    }
+  }
+}

@@ -309,21 +309,31 @@ one source of truth.
   single-tile GEMM as golden test. *No lowering passes.*
 - **M2 — Dialect → PTX.** Lowering passes via NVGPU/NVVM (or direct PTX
   printer as fallback); parity with the reference kernel's PTX/SASS.
-- **M3 — Real mainloop.** IR loop nodes with loop-carried stage/phase state;
-  `Pipeline<STAGES>`; `setmaxnreg` role rebalancing; double-buffered TMEM
-  accumulators (epilogue overlap).
-- **M4 — Hardware breadth.** Swizzled layouts, `cta_group::2` + clusters
-  (role model already anticipates leader-CTA roles), TMA multicast.
+- **M3 — Real mainloop.** Runtime `patina.for` loop nodes with loop-carried
+  (stage, phase) state; `Pipeline<STAGES>` ring (full[S]+empty[S] barrier
+  arrays, runtime phase values); staged smem; dynamic UMMA scaleC. Scope cut:
+  single output tile / single accumulator — no epilogue overlap yet.
+- **M4 — Hardware breadth + mainloop polish.** Swizzled layouts,
+  `cta_group::2` + clusters (role model already anticipates leader-CTA
+  roles), TMA multicast; `setmaxnreg` role rebalancing, persistent tile loop,
+  double-buffered TMEM accumulators (epilogue overlap) — deferred from M3.
 - **M5 — Tooling polish.** `melior` in-process MLIR bindings, error
   diagnostics mapped back to Rust source spans, kernel cache.
 
 ## 11. Open questions
 
-1. **UMMA op shape**: `begin/step/advance_k/commit` chain vs one flat
-   `patina.umma.mma` op per K16 step with an explicit descriptor-carried
-   value. Sets the dialect's abstraction altitude — decide first in M1.
-2. **Phase modeling across loops** (M3): phase attributes suffice for M1's
-   single-use barriers; ring pipelines may need phase *values*.
+1. ~~**UMMA op shape**~~ **Resolved (M1, kept in M3)**: the
+   `begin/step/advance_k/commit` chain stays. It mirrors the tcgen05
+   dataflow (descriptor-carrying chain, K-advance between steps, one commit
+   per MMA group) and M3's dynamic scaleC fits it as a step *operand*
+   (`accum %c`) without reshaping the op set.
+2. ~~**Phase modeling across loops**~~ **Resolved (M3)**: ring pipelines make
+   phases *runtime values*, not attributes. `patina.wait_stage %pipe, kind,
+   %s, %ph` carries the phase as a `!patina.u32` value, loop-carried with the
+   stage index by `patina.for`; `patina.stage_next` advances the stage mod S
+   and flips the phase on wrap. Convention: producer waits `empty` with
+   initial phase 1, consumer waits `full` with initial phase 0. Type-level
+   phase attributes remain for v1-style single-use barriers.
 3. **Role→warp assignment**: auto-pack (v1 choice, printed in IR dump) vs
    user-pinned; interacts with `setmaxnreg` warpgroup granularity in M3.
 4. **crates.io name**: `patina` appears unclaimed (404 on the registry API);
