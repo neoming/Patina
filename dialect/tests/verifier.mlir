@@ -1,7 +1,7 @@
 // dialect/tests/verifier.mlir
 //
-// Verifier contract for patina-opt. Each case is separated by `// -----`
-// and runs independently:
+// Verifier contract for patina-opt. Each case is separated by a `//` dash
+// line and runs independently:
 //   RUN: patina-opt --verify-diagnostics --split-input-file %s
 //
 // The first module must verify clean; every following module must fail with
@@ -27,6 +27,8 @@ patina.kernel @ok
 // -----
 // invalid: umma op inside a load role region
 // ===========================================================================
+#lay = #patina.umma_k_major<swizzle_none>
+
 patina.kernel @bad_role
     version = 0.1, arch = #patina.arch<sm_100a>, block = 64,
     roles = [#patina.role<load, 1>, #patina.role<mma, 1>]
@@ -46,6 +48,8 @@ patina.kernel @bad_role
 // -----
 // invalid: expect_tx byte count does not match the copies on that barrier
 // ===========================================================================
+#lay = #patina.umma_k_major<swizzle_none>
+
 patina.kernel @bad_tx
     version = 0.1, arch = #patina.arch<sm_100a>, block = 32,
     roles = [#patina.role<load, 1>]

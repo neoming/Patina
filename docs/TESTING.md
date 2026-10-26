@@ -23,8 +23,9 @@ cargo test --test layout
 cargo test --test golden_v1_gemm
 BLESS=1 cargo test --test golden_v1_gemm   # rewrite golden after intentional changes
 
-# M1c: dialect verifier contract
-patina-opt --verify-diagnostics --split-input-file dialect/tests/verifier.mlir
+# M1c/M2a: dialect verifier contract (build patina-opt first, see mlir/README.md)
+mlir/build/bin/patina-opt --verify-diagnostics --split-input-file dialect/tests/verifier.mlir
+mlir/build/bin/patina-opt crates/patina/tests/golden/v1_gemm.mlir   # golden verifies clean
 ```
 
 ## Rules for changing tests
@@ -32,7 +33,9 @@ patina-opt --verify-diagnostics --split-input-file dialect/tests/verifier.mlir
 - The golden `.mlir` is changed only via `BLESS=1`, and the diff must be in
   the commit message.
 - A verifier diagnostic text change requires updating both
-  `dialect/PatinaOps.td` and `dialect/tests/verifier.mlir` in the same commit.
+  `mlir/include/patina/PatinaOps.td` (and its implementation in
+  `mlir/lib/PatinaOps.cpp`) and `dialect/tests/verifier.mlir` in the same
+  commit.
 - `crates/patina/tests/layout.rs` asserts **numbers**, not implementations — if a number
   here changes, the corresponding line in `tcgen05_gemm.cu` should change too;
   treat any mismatch as a bug somewhere, never silently update both.

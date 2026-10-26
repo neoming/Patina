@@ -1,7 +1,6 @@
 //===- PatinaAttrs.td - Patina dialect attributes -----------*- tablegen -*-===//
 //
-// Attributes of the Patina dialect: layouts, roles, arch, memory spaces.
-// Requires an LLVM/MLIR dev tree (mlir-tblgen); M1c build deferred.
+// Enums and attributes of the Patina dialect.
 //
 //===----------------------------------------------------------------------===//
 
@@ -12,25 +11,14 @@ include "mlir/IR/EnumAttr.td"
 include "PatinaDialect.td"
 
 // ---------------------------------------------------------------------------
-// Enums
+// Enums (C++ enum classes; used via EnumParameter / the RoleKind attr below)
 // ---------------------------------------------------------------------------
 
-// TMA/UMMA swizzle modes. v1 supports only SWIZZLE_NONE.
+// TMA/UMMA smem swizzle modes. v1 supports only SWIZZLE_NONE.
 def Patina_SwizzleNone : I32EnumAttrCase<"swizzle_none", 0>;
 
 def Patina_Swizzle : I32EnumAttr<"Swizzle", "TMA/UMMA smem swizzle mode",
     [Patina_SwizzleNone]> {
-  let cppNamespace = "::patina";
-  let genSpecializedAttr = 0;
-}
-
-// Role kinds, in canonical warp-assignment order.
-def Patina_RoleLoad : I32EnumAttrCase<"load", 0>;
-def Patina_RoleMma  : I32EnumAttrCase<"mma",  1>;
-def Patina_RoleEpi  : I32EnumAttrCase<"epi",  2>;
-
-def Patina_RoleKind : I32EnumAttr<"RoleKind", "warp-specialization role",
-    [Patina_RoleLoad, Patina_RoleMma, Patina_RoleEpi]> {
   let cppNamespace = "::patina";
   let genSpecializedAttr = 0;
 }
@@ -44,7 +32,7 @@ def Patina_Arch : I32EnumAttr<"Arch", "target GPU architecture",
   let genSpecializedAttr = 0;
 }
 
-// Memory spaces (appear bare inside type parameter lists, e.g.
+// Memory spaces (printed as bare keywords inside type parameter lists, e.g.
 // `!patina.tensor<f16, 128x32, smem, #lay>`).
 def Patina_SpaceGmem : I32EnumAttrCase<"gmem", 0>;
 def Patina_SpaceSmem : I32EnumAttrCase<"smem", 1>;
@@ -56,6 +44,24 @@ def Patina_Space : I32EnumAttr<"Space", "memory space",
   let genSpecializedAttr = 0;
 }
 
+// Role kinds, in canonical warp-assignment order. Generates the specialized
+// attribute class `RoleKindAttr` (used as the `kind` attribute of
+// `patina.role`, printed as a bare keyword by its custom format).
+def Patina_RoleLoad : I32EnumAttrCase<"load", 0>;
+def Patina_RoleMma  : I32EnumAttrCase<"mma",  1>;
+def Patina_RoleEpi  : I32EnumAttrCase<"epi",  2>;
+
+def Patina_RoleKind : I32EnumAttr<"RoleKind", "warp-specialization role",
+    [Patina_RoleLoad, Patina_RoleMma, Patina_RoleEpi]> {
+  let cppNamespace = "::patina";
+  let genSpecializedAttr = 0;
+}
+
+// The `kind` attribute of `patina.role` (printed as a bare keyword by the
+// op's custom format). Standalone form `#patina.role_kind<load>` is unused.
+def Patina_RoleKindAttr : EnumAttr<Patina_Dialect, Patina_RoleKind,
+    "role_kind">;
+
 // ---------------------------------------------------------------------------
 // Attributes
 // ---------------------------------------------------------------------------
@@ -63,6 +69,13 @@ def Patina_Space : I32EnumAttr<"Space", "memory space",
 class Patina_Attr<string name, string attrMnemonic, list<Trait> traits = []>
     : AttrDef<Patina_Dialect, name, traits> {
   let mnemonic = attrMnemonic;
+}
+
+// Target arch: `#patina.arch<sm_100a>`.
+def Patina_ArchAttr : Patina_Attr<"Arch", "arch"> {
+  let summary = "target GPU architecture";
+  let parameters = (ins EnumParameter<Patina_Arch>:$value);
+  let assemblyFormat = "`<` $value `>`";
 }
 
 // Canonical UMMA K-major smem layout. Printed `#patina.umma_k_major<...>`;
@@ -77,9 +90,8 @@ def Patina_UmmaKMajorAttr : Patina_Attr<"UmmaKMajor", "umma_k_major"> {
     `{K*elt, 8*elt, 8*K*elt}` — one layout value drives host TMA encode and
     device descriptor packing (see patina::layout::UmmaKMajor).
   }];
-  let parameters = (ins "Patina_Space" : $space, "Patina_Swizzle" : $swizzle);
-  // NOTE: the golden syntax `#patina.umma_k_major<swizzle_none>` carries only
-  // the swizzle; the space parameter defaults to smem in the custom parser.
+  let parameters = (ins EnumParameter<Patina_Swizzle>:$swizzle);
+  let assemblyFormat = "`<` $swizzle `>`";
 }
 
 // One role of a kernel's warp specialization: `#patina.role<load, 1>`.
@@ -90,15 +102,8 @@ def Patina_RoleAttr : Patina_Attr<"Role", "role"> {
     verifier checks that the sum of warp counts x 32 equals `block` threads:
     "roles require 8 warps (256 threads) but block = 128".
   }];
-  let parameters = (ins "Patina_RoleKind" : $kind, "uint32_t" : $warps);
+  let parameters = (ins EnumParameter<Patina_RoleKind>:$kind, "uint32_t":$warps);
   let assemblyFormat = "`<` $kind `,` $warps `>`";
-}
-
-// Target arch: `#patina.arch<sm_100a>`.
-def Patina_ArchAttr : Patina_Attr<"ArchAttr", "arch"> {
-  let summary = "target GPU architecture";
-  let parameters = (ins "Patina_Arch" : $value);
-  let assemblyFormat = "`<` $value `>`";
 }
 
 #endif // PATINA_ATTRS_TD
