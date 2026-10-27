@@ -1,0 +1,344 @@
+// tests/golden/v2_gemm_pipelined.ptx
+//
+// Golden PTX for the v2 pipelined-mainloop GEMM: C[128,128] f32 +=
+// A[128,K] * B[128,K]^T, K = k_tiles * 32, 4-stage smem ring pipeline
+// (dialect source: tests/golden/v2_gemm_pipelined.mlir).
+// Emitted by patina::ffi::lower_to_ptx (M3); the Rust test
+// tests/lower_ptx_v2.rs compares textually. Update with BLESS=1 cargo test.
+// Validate standalone: ptxas -arch=sm_100a tests/golden/v2_gemm_pipelined.ptx
+//
+// Differences from v1: runtime K loop in both load and mma roles, stage
+// indexed full/empty barrier arrays + smem tiles, phases as REGISTERS
+// (loop-carried, flipped on wrap), dynamic scaleC on the first K16 step
+// of each tile, and a drain commit on acc_done after the mma loop.
+
+.version 8.7
+.target sm_100a
+.address_size 64
+
+// Dynamic shared memory: 4-stage smem ring, sa at dyn_smem+0 (32 KiB),
+// sb at dyn_smem+32768 (32 KiB). 64 KiB exceeds the 48 KiB static .shared
+// limit, so the host must pass 65536 B at launch (with the static tail
+// below). Barriers and the TMEM slot stay static.
+.extern .shared .b8 dyn_smem[];
+
+.visible .entry tcgen05_gemm_v2(
+    .param .align 64 .b8 tma_a[128],
+    .param .align 64 .b8 tma_b[128],
+    .param .u64 c,
+    .param .u32 k_tiles
+)
+.maxntid 192, 1, 1
+{
+    .reg .pred %p<8>;
+    .reg .b32 %tidx, %warpid, %laneid, %ewarp;
+    .reg .b32 %bar_acc_done, %cols, %tx;
+    .reg .b32 %tmem, %tmem_w, %lane_off, %tmem_addr, %smem_addr;
+    .reg .b32 %idesc, %scale_c, %zero, %row;
+    .reg .b64 %tma_a_ptr, %tma_b_ptr, %c_ptr;
+    .reg .b64 %da, %db, %off, %row_base, %st_base, %st_addr;
+    .reg .f32 %f<128>;
+    .reg .b32 %kt, %i, %s, %ph, %i4, %cont;
+    .reg .b32 %bar_base, %bar_s, %tmp, %sa_s, %sb_s;
+
+    // CTA scope: the smem ring lives in dyn_smem (file scope, above);
+    // static: full/empty barrier arrays, one drain barrier, the TMEM slot.
+    .shared .align 8 .b64 full_bar[4];
+    .shared .align 8 .b64 empty_bar[4];
+    .shared .align 8 .b64 acc_done_bar;
+    .shared .align 4 .b32 tmem_base;
+
+    mov.u32 %tidx, %tid.x;
+    shr.u32 %warpid, %tidx, 5;
+    and.b32 %laneid, %tidx, 31;
+
+    // barriers: thread 0 (full[0..4], empty[0..4], acc_done; 8 B stride)
+    setp.ne.s32 %p1, %tidx, 0;
+    @%p1 bra L_no_init;
+    mov.u32 %bar_base, full_bar;
+    mbarrier.init.shared::cta.b64 [%bar_base], 1;
+    add.s32 %bar_s, %bar_base, 8;
+    mbarrier.init.shared::cta.b64 [%bar_s], 1;
+    add.s32 %bar_s, %bar_s, 8;
+    mbarrier.init.shared::cta.b64 [%bar_s], 1;
+    add.s32 %bar_s, %bar_s, 8;
+    mbarrier.init.shared::cta.b64 [%bar_s], 1;
+    mov.u32 %bar_base, empty_bar;
+    mbarrier.init.shared::cta.b64 [%bar_base], 1;
+    add.s32 %bar_s, %bar_base, 8;
+    mbarrier.init.shared::cta.b64 [%bar_s], 1;
+    add.s32 %bar_s, %bar_s, 8;
+    mbarrier.init.shared::cta.b64 [%bar_s], 1;
+    add.s32 %bar_s, %bar_s, 8;
+    mbarrier.init.shared::cta.b64 [%bar_s], 1;
+    mov.u32 %bar_acc_done, acc_done_bar;
+    mbarrier.init.shared::cta.b64 [%bar_acc_done], 1;
+    fence.mbarrier_init.release.cluster;
+L_no_init:
+
+    // tmem columns: warp 0 (tcgen05.alloc is warp-collective)
+    setp.ne.s32 %p2, %warpid, 0;
+    @%p2 bra L_no_alloc;
+    mov.u32 %tmem_addr, tmem_base;
+    mov.b32 %cols, 128;
+    tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%tmem_addr], %cols;
+    tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;
+L_no_alloc:
+    bar.sync 0;
+
+    // role dispatch: warp 0 = load, warp 1 = mma, warps 2..5 = epi
+    setp.eq.s32 %p1, %warpid, 0;
+    @%p1 bra L_load;
+    setp.eq.s32 %p2, %warpid, 1;
+    @%p2 bra L_mma;
+    bra L_epi;
+
+    // ---- load role: producer loop, one K tile of A/B per stage
+L_load:
+    ld.param.u32 %kt, [k_tiles];
+    mov.b32 %i, 0;
+    mov.b32 %s, 0;
+    mov.b32 %ph, 1;
+LOOP_0:
+    setp.ge.u32 %p1, %i, %kt;
+    @%p1 bra LOOP_0_END;
+    // acquire: wait empty[s] with the carried phase (starts at 1)
+    mov.u32 %bar_base, empty_bar;
+    shl.b32 %tmp, %s, 3;
+    add.s32 %bar_s, %bar_base, %tmp;
+    {
+    .reg .pred P;
+LOOP_0_WAIT:
+    mbarrier.try_wait.parity.shared::cta.b64 P, [%bar_s], %ph;
+    @!P bra LOOP_0_WAIT;
+    }
+    setp.ne.s32 %p2, %laneid, 0;
+    @%p2 bra LOOP_0_NEXT;
+    // publish: expect both tiles (16384 B) on full[s]
+    mov.u32 %bar_base, full_bar;
+    shl.b32 %tmp, %s, 3;
+    add.s32 %bar_s, %bar_base, %tmp;
+    mov.b32 %tx, 16384;
+    mbarrier.arrive.expect_tx.shared::cta.b64 _, [%bar_s], %tx;
+    // stage buffers: dyn_smem (sa at 0, sb at 32768) + s * 8192
+    mov.u32 %smem_addr, dyn_smem;
+    shl.b32 %tmp, %s, 13;
+    add.s32 %sa_s, %smem_addr, %tmp;
+    mov.u32 %smem_addr, dyn_smem;
+    add.s32 %smem_addr, %smem_addr, 32768;
+    shl.b32 %tmp, %s, 13;
+    add.s32 %sb_s, %smem_addr, %tmp;
+    // K coordinate: 4 * i
+    shl.b32 %i4, %i, 2;
+    mov.b32 %zero, 0;
+    mov.b64 %tma_a_ptr, tma_a;
+    cvta.param.u64 %tma_a_ptr, %tma_a_ptr;
+    mov.u32 %bar_base, full_bar;
+    shl.b32 %tmp, %s, 3;
+    add.s32 %bar_s, %bar_base, %tmp;
+    cp.async.bulk.tensor.4d.shared::cta.global.tile.mbarrier::complete_tx::bytes [%sa_s], [%tma_a_ptr, {%zero, %zero, %i4, %zero}], [%bar_s];
+    mov.b64 %tma_b_ptr, tma_b;
+    cvta.param.u64 %tma_b_ptr, %tma_b_ptr;
+    mov.u32 %bar_base, full_bar;
+    shl.b32 %tmp, %s, 3;
+    add.s32 %bar_s, %bar_base, %tmp;
+    cp.async.bulk.tensor.4d.shared::cta.global.tile.mbarrier::complete_tx::bytes [%sb_s], [%tma_b_ptr, {%zero, %zero, %i4, %zero}], [%bar_s];
+LOOP_0_NEXT:
+    add.s32 %s, %s, 1;
+    setp.eq.u32 %p3, %s, 4;
+    @%p3 mov.b32 %s, 0;
+    @%p3 xor.b32 %ph, %ph, 1;
+    add.s32 %i, %i, 1;
+    bra LOOP_0;
+LOOP_0_END:
+    bra L_join;
+
+    // ---- mma role: consumer loop, 2 K16 steps per tile into the TMEM acc
+L_mma:
+    ld.param.u32 %kt, [k_tiles];
+    mov.b32 %i, 0;
+    mov.b32 %s, 0;
+    mov.b32 %ph, 0;
+LOOP_1:
+    setp.ge.u32 %p1, %i, %kt;
+    @%p1 bra LOOP_1_END;
+    // acquire: wait full[s] with the carried phase (starts at 0)
+    mov.u32 %bar_base, full_bar;
+    shl.b32 %tmp, %s, 3;
+    add.s32 %bar_s, %bar_base, %tmp;
+    {
+    .reg .pred P;
+LOOP_1_WAIT:
+    mbarrier.try_wait.parity.shared::cta.b64 P, [%bar_s], %ph;
+    @!P bra LOOP_1_WAIT;
+    }
+    setp.ne.s32 %p2, %laneid, 0;
+    @%p2 bra LOOP_1_NEXT;
+    // stage buffers: dyn_smem (sa at 0, sb at 32768) + s * 8192
+    mov.u32 %smem_addr, dyn_smem;
+    shl.b32 %tmp, %s, 13;
+    add.s32 %sa_s, %smem_addr, %tmp;
+    mov.u32 %smem_addr, dyn_smem;
+    add.s32 %smem_addr, %smem_addr, 32768;
+    shl.b32 %tmp, %s, 13;
+    add.s32 %sb_s, %smem_addr, %tmp;
+    // dynamic scaleC: i != 0 (overwrite on tile 0, accumulate after)
+    setp.ne.u32 %p4, %i, 0;
+    selp.b32 %cont, 1, 0, %p4;
+    ld.shared.u32 %tmem, [tmem_base];
+    // smem descriptors: (addr >> 4) | LBO(128)>>4<<16 | SBO(256)>>4<<32 | version 1<<46
+    shr.u32 %lane_off, %sa_s, 4;
+    cvt.u64.u32 %da, %lane_off;
+    or.b64 %da, %da, 70437464178688;
+    shr.u32 %lane_off, %sb_s, 4;
+    cvt.u64.u32 %db, %lane_off;
+    or.b64 %db, %db, 70437464178688;
+    // idesc: f16 in, f32 acc, M=128, N=128, K-major
+    mov.b32 %idesc, 136314896;
+    mov.b32 %zero, 0;
+    mov.b32 %scale_c, %cont;
+    {
+    .reg .pred SC;
+    setp.ne.b32 SC, %scale_c, 0;
+    tcgen05.mma.cta_group::1.kind::f16 [%tmem], %da, %db, %idesc, {%zero,%zero,%zero,%zero}, SC;
+    }
+    // K advances between steps: 16 halves = 2 core matrices = 16 desc units
+    add.s64 %da, %da, 16;
+    add.s64 %db, %db, 16;
+    mov.b32 %scale_c, 1;
+    {
+    .reg .pred SC;
+    setp.ne.b32 SC, %scale_c, 0;
+    tcgen05.mma.cta_group::1.kind::f16 [%tmem], %da, %db, %idesc, {%zero,%zero,%zero,%zero}, SC;
+    }
+    // release: commit the MMA group onto empty[s]
+    mov.u32 %bar_base, empty_bar;
+    shl.b32 %tmp, %s, 3;
+    add.s32 %bar_s, %bar_base, %tmp;
+    tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%bar_s];
+LOOP_1_NEXT:
+    add.s32 %s, %s, 1;
+    setp.eq.u32 %p3, %s, 4;
+    @%p3 mov.b32 %s, 0;
+    @%p3 xor.b32 %ph, %ph, 1;
+    add.s32 %i, %i, 1;
+    bra LOOP_1;
+LOOP_1_END:
+    // drain: one more commit on acc_done so the epilogue can wait the group
+    setp.ne.s32 %p2, %laneid, 0;
+    @%p2 bra L_join;
+    mov.u32 %bar_acc_done, acc_done_bar;
+    tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%bar_acc_done];
+    bra L_join;
+
+    // ---- epi role: warps 2..5, all lanes; 128 f32 per thread = 4 chunks of 32
+L_epi:
+    mov.u32 %bar_acc_done, acc_done_bar;
+    {
+    .reg .pred P;
+WAIT_0:
+    mbarrier.try_wait.parity.shared::cta.b64 P, [%bar_acc_done], 0;
+    @!P bra WAIT_0;
+    }
+    // per-warp TMEM lane window: tmem + ((warp - 2) << 21)
+    ld.shared.u32 %tmem, [tmem_base];
+    sub.s32 %ewarp, %warpid, 2;
+    shl.b32 %lane_off, %ewarp, 21;
+    add.s32 %tmem_w, %tmem, %lane_off;
+    // row this thread stores: tid - 64; row pitch = 128 f32 = 512 B
+    sub.s32 %row, %tidx, 64;
+    ld.param.u64 %c_ptr, [c];
+    mul.wide.u32 %off, %row, 512;
+    add.s64 %row_base, %c_ptr, %off;
+
+    tcgen05.ld.sync.aligned.32x32b.x32.b32 {%f0,%f1,%f2,%f3,%f4,%f5,%f6,%f7,%f8,%f9,%f10,%f11,%f12,%f13,%f14,%f15,%f16,%f17,%f18,%f19,%f20,%f21,%f22,%f23,%f24,%f25,%f26,%f27,%f28,%f29,%f30,%f31}, [%tmem_w];
+    tcgen05.wait::ld.sync.aligned;
+    st.global.v4.f32 [%row_base], {%f0,%f1,%f2,%f3};
+    add.s64 %st_addr, %row_base, 16;
+    st.global.v4.f32 [%st_addr], {%f4,%f5,%f6,%f7};
+    add.s64 %st_addr, %row_base, 32;
+    st.global.v4.f32 [%st_addr], {%f8,%f9,%f10,%f11};
+    add.s64 %st_addr, %row_base, 48;
+    st.global.v4.f32 [%st_addr], {%f12,%f13,%f14,%f15};
+    add.s64 %st_addr, %row_base, 64;
+    st.global.v4.f32 [%st_addr], {%f16,%f17,%f18,%f19};
+    add.s64 %st_addr, %row_base, 80;
+    st.global.v4.f32 [%st_addr], {%f20,%f21,%f22,%f23};
+    add.s64 %st_addr, %row_base, 96;
+    st.global.v4.f32 [%st_addr], {%f24,%f25,%f26,%f27};
+    add.s64 %st_addr, %row_base, 112;
+    st.global.v4.f32 [%st_addr], {%f28,%f29,%f30,%f31};
+
+    add.s32 %tmem_addr, %tmem_w, 32;
+    tcgen05.ld.sync.aligned.32x32b.x32.b32 {%f32,%f33,%f34,%f35,%f36,%f37,%f38,%f39,%f40,%f41,%f42,%f43,%f44,%f45,%f46,%f47,%f48,%f49,%f50,%f51,%f52,%f53,%f54,%f55,%f56,%f57,%f58,%f59,%f60,%f61,%f62,%f63}, [%tmem_addr];
+    tcgen05.wait::ld.sync.aligned;
+    add.s64 %st_base, %row_base, 128;
+    st.global.v4.f32 [%st_base], {%f32,%f33,%f34,%f35};
+    add.s64 %st_addr, %st_base, 16;
+    st.global.v4.f32 [%st_addr], {%f36,%f37,%f38,%f39};
+    add.s64 %st_addr, %st_base, 32;
+    st.global.v4.f32 [%st_addr], {%f40,%f41,%f42,%f43};
+    add.s64 %st_addr, %st_base, 48;
+    st.global.v4.f32 [%st_addr], {%f44,%f45,%f46,%f47};
+    add.s64 %st_addr, %st_base, 64;
+    st.global.v4.f32 [%st_addr], {%f48,%f49,%f50,%f51};
+    add.s64 %st_addr, %st_base, 80;
+    st.global.v4.f32 [%st_addr], {%f52,%f53,%f54,%f55};
+    add.s64 %st_addr, %st_base, 96;
+    st.global.v4.f32 [%st_addr], {%f56,%f57,%f58,%f59};
+    add.s64 %st_addr, %st_base, 112;
+    st.global.v4.f32 [%st_addr], {%f60,%f61,%f62,%f63};
+
+    add.s32 %tmem_addr, %tmem_w, 64;
+    tcgen05.ld.sync.aligned.32x32b.x32.b32 {%f64,%f65,%f66,%f67,%f68,%f69,%f70,%f71,%f72,%f73,%f74,%f75,%f76,%f77,%f78,%f79,%f80,%f81,%f82,%f83,%f84,%f85,%f86,%f87,%f88,%f89,%f90,%f91,%f92,%f93,%f94,%f95}, [%tmem_addr];
+    tcgen05.wait::ld.sync.aligned;
+    add.s64 %st_base, %row_base, 256;
+    st.global.v4.f32 [%st_base], {%f64,%f65,%f66,%f67};
+    add.s64 %st_addr, %st_base, 16;
+    st.global.v4.f32 [%st_addr], {%f68,%f69,%f70,%f71};
+    add.s64 %st_addr, %st_base, 32;
+    st.global.v4.f32 [%st_addr], {%f72,%f73,%f74,%f75};
+    add.s64 %st_addr, %st_base, 48;
+    st.global.v4.f32 [%st_addr], {%f76,%f77,%f78,%f79};
+    add.s64 %st_addr, %st_base, 64;
+    st.global.v4.f32 [%st_addr], {%f80,%f81,%f82,%f83};
+    add.s64 %st_addr, %st_base, 80;
+    st.global.v4.f32 [%st_addr], {%f84,%f85,%f86,%f87};
+    add.s64 %st_addr, %st_base, 96;
+    st.global.v4.f32 [%st_addr], {%f88,%f89,%f90,%f91};
+    add.s64 %st_addr, %st_base, 112;
+    st.global.v4.f32 [%st_addr], {%f92,%f93,%f94,%f95};
+
+    add.s32 %tmem_addr, %tmem_w, 96;
+    tcgen05.ld.sync.aligned.32x32b.x32.b32 {%f96,%f97,%f98,%f99,%f100,%f101,%f102,%f103,%f104,%f105,%f106,%f107,%f108,%f109,%f110,%f111,%f112,%f113,%f114,%f115,%f116,%f117,%f118,%f119,%f120,%f121,%f122,%f123,%f124,%f125,%f126,%f127}, [%tmem_addr];
+    tcgen05.wait::ld.sync.aligned;
+    add.s64 %st_base, %row_base, 384;
+    st.global.v4.f32 [%st_base], {%f96,%f97,%f98,%f99};
+    add.s64 %st_addr, %st_base, 16;
+    st.global.v4.f32 [%st_addr], {%f100,%f101,%f102,%f103};
+    add.s64 %st_addr, %st_base, 32;
+    st.global.v4.f32 [%st_addr], {%f104,%f105,%f106,%f107};
+    add.s64 %st_addr, %st_base, 48;
+    st.global.v4.f32 [%st_addr], {%f108,%f109,%f110,%f111};
+    add.s64 %st_addr, %st_base, 64;
+    st.global.v4.f32 [%st_addr], {%f112,%f113,%f114,%f115};
+    add.s64 %st_addr, %st_base, 80;
+    st.global.v4.f32 [%st_addr], {%f116,%f117,%f118,%f119};
+    add.s64 %st_addr, %st_base, 96;
+    st.global.v4.f32 [%st_addr], {%f120,%f121,%f122,%f123};
+    add.s64 %st_addr, %st_base, 112;
+    st.global.v4.f32 [%st_addr], {%f124,%f125,%f126,%f127};
+
+    // ---- join: fence, CTA barrier, warp 0 deallocates the TMEM columns
+L_join:
+    tcgen05.fence::before_thread_sync;
+    bar.sync 0;
+    tcgen05.fence::after_thread_sync;
+    setp.ne.s32 %p1, %warpid, 0;
+    @%p1 bra L_ret;
+    ld.shared.u32 %tmem, [tmem_base];
+    mov.b32 %cols, 128;
+    tcgen05.dealloc.cta_group::1.sync.aligned.b32 %tmem, %cols;
+L_ret:
+    ret;
+}

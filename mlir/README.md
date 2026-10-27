@@ -43,16 +43,20 @@ libLLVM/libMLIR) and at run time for `patina-opt`.
 L=~/.local/llvm-21/root/usr/lib/llvm-21
 export LD_LIBRARY_PATH=$L/lib
 
-# golden kernel must verify clean and round-trip
+# golden kernels must verify clean and round-trip (v1 single-tile, v2
+# pipelined mainloop)
 mlir/build/bin/patina-opt crates/patina/tests/golden/v1_gemm.mlir
+mlir/build/bin/patina-opt crates/patina/tests/golden/v2_gemm_pipelined.mlir
 
-# verifier contract: 5 expected-error cases
+# verifier contract: 5 expected-error cases (M1/M2) + 3 pipelined-mainloop
+# cases (M3), plus 2 valid kernels
 mlir/build/bin/patina-opt --verify-diagnostics --split-input-file \
   dialect/tests/verifier.mlir
 
-# lower the golden kernel to PTX (goes to stdout, followed by an empty
+# lower the golden kernels to PTX (goes to stdout, followed by an empty
 # `module {}` from the driver)
 mlir/build/bin/patina-opt -lower-to-ptx crates/patina/tests/golden/v1_gemm.mlir
+mlir/build/bin/patina-opt -lower-to-ptx crates/patina/tests/golden/v2_gemm_pipelined.mlir
 ```
 
 The same lowering is reachable from Rust via `patina::ffi::lower_to_ptx`;
