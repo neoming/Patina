@@ -28,6 +28,7 @@
 #include "mlir/Pass/PassRegistry.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <algorithm>
 #include <map>
 #include <vector>
 
@@ -72,6 +73,11 @@ struct Lowerer {
   std::map<std::string, uint64_t> dynOffset; // staged smem -> dyn_smem offset
   int loopCounter = 0;
   int curLoop = -1;
+  // Value names of the patina.for being lowered (front-end convention
+  // %i/%s/%ph; hand-written kernels may rename them).
+  std::string curIndex = "%i", curStage = "%s", curPhase = "%ph";
+  // Loop-carried names beyond the fixed register pool (renamed loops).
+  std::vector<std::string> extraRegs;
 
   // Roles: kind -> first warp. v1 packs load / mma / epi contiguously.
   uint32_t loadBase = 0, mmaBase = 0, epiBase = 0, epiWarps = 0;
@@ -173,6 +179,52 @@ struct Lowerer {
       return fail("v1 lowering: missing tmem.alloc");
     if (!ws)
       return fail("v1 lowering: missing warp_specialize");
+
+    // Register names for loop-carried values beyond the fixed pool: the
+    // patina.for index/iter_args plus muli/nez/stage_buf results. The
+    // front-end names (%i/%s/%ph/%i4/%cont/%sa_s/%sb_s) are all fixed-pool,
+    // so this stays empty for front-emitted kernels.
+    auto addReg = [&](StringRef name) {
+      std::string reg = "%" + name.str();
+      static const char *fixed[] = {"%kt", "%i",   "%s",  "%ph", "%i4",
+                                    "%cont", "%bar_base", "%bar_s", "%tmp",
+                                    "%sa_s", "%sb_s"};
+      for (const char *f : fixed)
+        if (reg == f)
+          return;
+      if (std::find(extraRegs.begin(), extraRegs.end(), reg) ==
+          extraRegs.end())
+        extraRegs.push_back(reg);
+    };
+    kernel.walk([&](ForOp forOp) {
+      addReg(forOp.getIndexName());
+      for (Attribute a : forOp.getIterNames())
+        addReg(cast<StringAttr>(a).getValue());
+    });
+    kernel.walk([&](MuliOp op) { addReg(op.getValueName()); });
+    kernel.walk([&](NezOp op) { addReg(op.getValueName()); });
+    kernel.walk([&](StageBufOp op) { addReg(op.getValueName()); });
+
+    // Pipeline barrier kinds are bare keywords; reject typos here instead of
+    // silently mapping them to the wrong barrier array at emission.
+    std::string badKind;
+    auto checkKind = [&](StringRef kind) {
+      if (kind != "empty" && kind != "full" && badKind.empty())
+        badKind = kind.str();
+    };
+    kernel.walk([&](WaitStageOp op) { checkKind(op.getKind()); });
+    kernel.walk([&](ExpectTxStageOp op) { checkKind(op.getKind()); });
+    kernel.walk([&](TmaLoadOp op) {
+      if (auto k = op.getCompleteKindAttr())
+        checkKind(k.getValue());
+    });
+    kernel.walk([&](UmmaCommitOp op) {
+      if (auto k = op.getBarrierKindAttr())
+        checkKind(k.getValue());
+    });
+    if (!badKind.empty())
+      return fail("pipeline barrier kind '" + badKind +
+                  "' is not 'empty' or 'full'");
 
     // Role warp packing from the kernel's roles attribute.
     uint32_t base = 0;
@@ -294,6 +346,12 @@ struct Lowerer {
     if (pipelined)
       os << "    .reg .b32 %kt, %i, %s, %ph, %i4, %cont;\n"
          << "    .reg .b32 %bar_base, %bar_s, %tmp, %sa_s, %sb_s;\n";
+    if (!extraRegs.empty()) {
+      os << "    .reg .b32 ";
+      for (size_t i = 0; i < extraRegs.size(); ++i)
+        os << (i ? ", " : "") << extraRegs[i];
+      os << ";\n";
+    }
     os << "\n";
 
     os << "    // CTA scope: smem tiles, barriers, and the TMEM column slot\n";
@@ -383,6 +441,9 @@ struct Lowerer {
            << "    mbarrier.arrive.expect_tx.shared::cta.b64 _, [%bar_" << bar
            << "], %tx;\n";
       } else if (auto load = dyn_cast<TmaLoadOp>(&op)) {
+        if (load.getCompleteKindAttr())
+          return fail("v1 lowering: staged tma_load completion requires the "
+                      "pipelined (M3) lowering");
         std::string map = nameOf(load.getMapAttr());
         std::string dst = nameOf(load.getDstAttr());
         std::string bar = nameOf(load.getCompleteAttr());
@@ -470,6 +531,9 @@ struct Lowerer {
            << "    add.s64 %da, %da, " << adv.getK() << ";\n"
            << "    add.s64 %db, %db, " << adv.getK() << ";\n";
       } else if (auto commit = dyn_cast<UmmaCommitOp>(&op)) {
+        if (commit.getBarrierKindAttr())
+          return fail("v1 lowering: staged umma.commit requires the "
+                      "pipelined (M3) lowering");
         std::string bar = nameOf(commit.getBarrierAttr());
         emitBarrierAddr(bar);
         os << "    "
@@ -493,7 +557,7 @@ struct Lowerer {
   void emitStageBarrierAddr(StringRef kind) {
     os << "    mov.u32 %bar_base, " << (kind == "full" ? "full_bar" : "empty_bar")
        << ";\n"
-       << "    shl.b32 %tmp, %s, 3;\n"
+       << "    shl.b32 %tmp, " << curStage << ", 3;\n"
        << "    add.s32 %bar_s, %bar_base, %tmp;\n";
   }
 
@@ -503,7 +567,8 @@ struct Lowerer {
     os << "    {\n"
        << "    .reg .pred P;\n"
        << "LOOP_" << curLoop << "_WAIT:\n"
-       << "    mbarrier.try_wait.parity.shared::cta.b64 P, [%bar_s], %ph;\n"
+       << "    mbarrier.try_wait.parity.shared::cta.b64 P, [%bar_s], "
+       << curPhase << ";\n"
        << "    @!P bra LOOP_" << curLoop << "_WAIT;\n"
        << "    }\n";
   }
@@ -517,6 +582,12 @@ struct Lowerer {
   // Loop preamble: bound load, loop-carried inits, condition check.
   bool emitForBegin(ForOp forOp) {
     curLoop = loopCounter++;
+    curIndex = "%" + forOp.getIndexName().str();
+    ArrayAttr iterNames = forOp.getIterNames();
+    if (iterNames.size() < 2)
+      return fail("v2 lowering: patina.for needs (stage, phase) iter_args");
+    curStage = "%" + cast<StringAttr>(iterNames[0]).getValue().str();
+    curPhase = "%" + cast<StringAttr>(iterNames[1]).getValue().str();
     // The bound must be a !patina.u32 kernel parameter.
     const ParamInfo *bound = nullptr;
     for (const ParamInfo &p : params)
@@ -533,16 +604,19 @@ struct Lowerer {
       os << "    mov.b32 %" << cast<StringAttr>(names[j]).getValue() << ", "
          << inits[j] << ";\n";
     os << "LOOP_" << curLoop << ":\n"
-       << "    setp.ge.u32 %p1, %i, %kt;\n"
+       << "    setp.ge.u32 %p1, " << curIndex << ", %kt;\n"
        << "    @%p1 bra LOOP_" << curLoop << "_END;\n";
     return true;
   }
 
   void emitForEnd() {
-    os << "    add.s32 %i, %i, 1;\n"
+    os << "    add.s32 " << curIndex << ", " << curIndex << ", 1;\n"
        << "    bra LOOP_" << curLoop << ";\n"
        << "LOOP_" << curLoop << "_END:\n";
     curLoop = -1;
+    curIndex = "%i";
+    curStage = "%s";
+    curPhase = "%ph";
   }
 
   // %res = %base + %s * tile_bytes (tile bytes are a power of two).
@@ -556,7 +630,7 @@ struct Lowerer {
     os << "    mov.u32 %smem_addr, dyn_smem;\n";
     if (it->second)
       os << "    add.s32 %smem_addr, %smem_addr, " << it->second << ";\n";
-    os << "    shl.b32 %tmp, %s, " << shift << ";\n"
+    os << "    shl.b32 %tmp, " << curStage << ", " << shift << ";\n"
        << "    add.s32 %" << sb.getValueName() << ", %smem_addr, %tmp;\n";
     return true;
   }
@@ -581,10 +655,10 @@ struct Lowerer {
   // Ring advance: %s = (%s + 1) mod S, phase flips on wrap.
   void emitStageNext() {
     os << "LOOP_" << curLoop << "_NEXT:\n"
-       << "    add.s32 %s, %s, 1;\n"
-       << "    setp.eq.u32 %p3, %s, " << pipeStages << ";\n"
-       << "    @%p3 mov.b32 %s, 0;\n"
-       << "    @%p3 xor.b32 %ph, %ph, 1;\n";
+       << "    add.s32 " << curStage << ", " << curStage << ", 1;\n"
+       << "    setp.eq.u32 %p3, " << curStage << ", " << pipeStages << ";\n"
+       << "    @%p3 mov.b32 " << curStage << ", 0;\n"
+       << "    @%p3 xor.b32 " << curPhase << ", " << curPhase << ", 1;\n";
   }
 
   bool emitTmaLoadV2(TmaLoadOp load, bool &zeroEmitted) {

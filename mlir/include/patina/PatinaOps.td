@@ -302,6 +302,10 @@ def Patina_WaitStageOp : Patina_Op<"wait_stage", []> {
     `patina.wait_stage %pipe, empty, %s, %ph` — the phase is a runtime
     `!patina.u32` value (ring pipelines make type-level phases impossible).
 
+    Verifier (kind) — `kind` is a bare keyword and must be `empty` or
+    `full`; typos are rejected rather than read as `full`:
+      "unknown pipeline barrier kind 'emtpy' (must be 'empty' or 'full')"
+
     Verifier (role rule) — `empty` waits belong to the producer (load role),
     `full` waits to the consumer (mma role):
       "'patina.wait_stage' on 'empty' barriers is only legal in a 'load'

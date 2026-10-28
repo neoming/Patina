@@ -168,3 +168,71 @@ fn lowered_v2_ptx_instruction_inventory() {
     assert_eq!(count(&code, "add.s64 %da, %da, 16;"), 1);
     assert_eq!(count(&code, "add.s64 %db, %db, 16;"), 1);
 }
+
+/// A pipeline kernel whose `patina.for` uses renamed index/iter_args (not the
+/// front-end's %i/%s/%ph). Regression: the lowering once initialized the
+/// parsed names but ran the loop skeleton on hardcoded %i/%s/%ph registers,
+/// emitting undeclared-register PTX while exiting 0.
+#[test]
+fn renamed_loop_vars_lower_to_consistent_ptx() {
+    let mlir = r#"
+#lay = #patina.umma_k_major<swizzle_none>
+
+patina.kernel @renamed_loop
+    version = 0.1, arch = #patina.arch<sm_100a>, block = 96,
+    roles = [#patina.role<load, 1>, #patina.role<mma, 1>, #patina.role<epi, 1>]
+  (%tma_a: !patina.tma_map<f16, #lay>,
+   %c: !patina.ptr<f32, gmem>,
+   %k_tiles: !patina.u32) {
+  %pipe = patina.pipeline.create stages = 4 : !patina.pipeline<4>
+  %sa = patina.smem_alloc stages = 4 : !patina.tensor<f16, 128x32, smem, #lay>
+  %acc_done = patina.mbarrier.create arrivals = 1 : !patina.mbarrier<1>
+  %acc = patina.tmem.alloc cols = 128 : !patina.tmem<f32, 128>
+  patina.warp_specialize {
+    patina.role load {
+      patina.for %j = 0 to %k_tiles iter_args(%x = 0, %p = 1) {
+        patina.wait_stage %pipe, empty, %x, %p
+        patina.expect_tx_stage %pipe, full, %x, 8192
+        %sa_s = patina.stage_buf %sa, %x : !patina.tensor<f16, 128x32, smem, #lay>
+        patina.tma_load %tma_a -> %sa_s, coords [0, 0, 0, 0], complete %pipe, full, %x
+        %x1, %p1 = patina.stage_next %x, %p of %pipe
+        patina.yield %x1, %p1
+      }
+    }
+    patina.role mma {
+      patina.for %j = 0 to %k_tiles iter_args(%x = 0, %p = 0) {
+        patina.wait_stage %pipe, full, %x, %p
+        %sa_s = patina.stage_buf %sa, %x : !patina.tensor<f16, 128x32, smem, #lay>
+        %m = patina.umma.begin %acc, %sa_s, %sa_s
+        patina.umma.step %m {accum = true}
+        patina.umma.commit %m -> %pipe, empty, %x
+        %x1, %p1 = patina.stage_next %x, %p of %pipe
+        patina.yield %x1, %p1
+      }
+      patina.umma.commit %m -> %acc_done
+    }
+    patina.role epi {
+      patina.wait %acc_done, phase = 0
+      %frag = patina.tmem_ld %acc : !patina.frag<f32, 128>
+      patina.store %c, %frag
+    }
+  }
+  patina.tmem.dealloc %acc
+}
+"#;
+    let ptx = ffi::lower_to_ptx(mlir).expect("renamed-loop kernel must lower");
+    // The renamed names must be declared and used consistently; the
+    // hardcoded %i/%s/%ph skeleton must be gone from the loop bodies.
+    assert!(ptx.contains(".reg .b32 %j, %x, %p;"), "missing decl:\n{ptx}");
+    assert!(ptx.contains("setp.ge.u32 %p1, %j, %kt;"), "loop cond:\n{ptx}");
+    assert!(
+        ptx.contains("mbarrier.try_wait.parity.shared::cta.b64 P, [%bar_s], %p;"),
+        "runtime-phase wait:\n{ptx}"
+    );
+    assert!(ptx.contains("shl.b32 %tmp, %x, 3;"), "stage addressing:\n{ptx}");
+    assert!(ptx.contains("setp.eq.u32 %p3, %x, 4;"), "ring wrap check:\n{ptx}");
+    assert!(
+        !ptx.contains("setp.ge.u32 %p1, %i, %kt;"),
+        "loop condition must not use the hardcoded %i:\n{ptx}"
+    );
+}

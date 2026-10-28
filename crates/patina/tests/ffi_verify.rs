@@ -82,3 +82,34 @@ fn unparseable_text_returns_diagnostic() {
     let err = ffi::verify("this is not mlir at all").expect_err("garbage must fail to parse");
     assert!(!err.is_empty(), "diagnostic must not be empty");
 }
+
+/// Pipeline barrier kinds are bare keywords; a typo must fail verification
+/// (it once verified clean as a fake 'full' wait and lowered onto the wrong
+/// barrier array).
+#[test]
+fn misspelled_stage_kind_is_rejected() {
+    let mlir = r#"
+patina.kernel @kind_typo
+    version = 0.1, arch = #patina.arch<sm_100a>, block = 64,
+    roles = [#patina.role<load, 1>, #patina.role<mma, 1>]
+  (%k_tiles: !patina.u32) {
+  %pipe = patina.pipeline.create stages = 4 : !patina.pipeline<4>
+  %acc = patina.tmem.alloc cols = 128 : !patina.tmem<f32, 128>
+  patina.warp_specialize {
+    patina.role load {
+      patina.for %i = 0 to %k_tiles iter_args(%s = 0, %ph = 1) {
+        patina.wait_stage %pipe, emtpy, %s, %ph
+        patina.yield %s, %ph
+      }
+    }
+    patina.role mma { }
+  }
+  patina.tmem.dealloc %acc
+}
+"#;
+    let err = ffi::verify(mlir).expect_err("misspelled barrier kind must fail verification");
+    assert!(
+        err.contains("unknown pipeline barrier kind 'emtpy' (must be 'empty' or 'full')"),
+        "unexpected diagnostic: {err}"
+    );
+}

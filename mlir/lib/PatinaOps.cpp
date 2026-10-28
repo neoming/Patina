@@ -788,9 +788,14 @@ void WaitStageOp::print(OpAsmPrinter &p) {
 }
 
 LogicalResult WaitStageOp::verify() {
+  // Kinds are bare keywords parsed from text; reject typos rather than
+  // treating everything that is not 'empty' as 'full'.
+  StringRef kind = getKind();
+  if (kind != "empty" && kind != "full")
+    return emitOpError("unknown pipeline barrier kind '")
+           << kind << "' (must be 'empty' or 'full')";
   // Producer waits `empty` (load role), consumer waits `full` (mma role).
   auto role = getOperation()->getParentOfType<RoleOp>();
-  StringRef kind = getKind();
   StringRef need = kind == "empty" ? "load" : "mma";
   StringRef have = role ? stringifyRoleKind(role.getKind()) : "";
   if (have != need)

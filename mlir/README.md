@@ -48,8 +48,8 @@ export LD_LIBRARY_PATH=$L/lib
 mlir/build/bin/patina-opt crates/patina/tests/golden/v1_gemm.mlir
 mlir/build/bin/patina-opt crates/patina/tests/golden/v2_gemm_pipelined.mlir
 
-# verifier contract: 5 expected-error cases (M1/M2) + 3 pipelined-mainloop
-# cases (M3), plus 2 valid kernels
+# verifier contract: 5 expected-error cases (M1/M2) + 4 pipelined-mainloop
+# cases (M3, incl. the misspelled-barrier-kind case), plus 2 valid kernels
 mlir/build/bin/patina-opt --verify-diagnostics --split-input-file \
   dialect/tests/verifier.mlir
 
