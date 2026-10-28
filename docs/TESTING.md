@@ -16,8 +16,15 @@ All of them compile and run; the suite going green *is* the milestone.
 | `crates/patina/tests/lower_ptx.rs` + `crates/patina/tests/golden/v1_gemm.ptx` | dialect → PTX | `cargo test` (M2c) | trace → emit → `patina::ffi::lower_to_ptx` matches the golden PTX; instruction inventory pinned (2 TMA copies, 2 UMMA steps with scaleC 0→1, 4 TMEM loads, barrier choreography); golden compiles under `ptxas -arch=sm_100a` |
 | `crates/patina/tests/golden_v2_gemm_pipelined.rs` + `crates/patina/tests/golden/v2_gemm_pipelined.mlir` | Rust → dialect | `cargo test` (M3: pipeline trace + printer) | the M3 DSL surface (Pipeline/StageBuf/LoopIx/Scalar/Val<u32>, `for_each` runtime loop, runtime mbarrier phases) + text-exact pipelined dialect output |
 | `crates/patina/tests/lower_ptx_v2.rs` + `crates/patina/tests/golden/v2_gemm_pipelined.ptx` | dialect → PTX | `cargo test` (M3-lowering) | pipelined lowering: `scf.for` → counted PTX loop with runtime phase flip, staged TMA/UMMA/barrier addressing (`shl.b32 %tmp, %s, 3` / `, %s, 13`), dynamic `scale_c`; staged tiles live in dynamic shared memory (64 KiB ring > 48 KiB static limit); golden compiles under `ptxas -arch=sm_100a` |
+| `harness/gemm_check.cpp` | PTX → hardware | on a GB200 only (`./harness/build.sh`, see `docs/HARDWARE_TESTING.md`) | end-to-end numerical check: driver-API load of the golden PTX, `C = A·Bᵀ` vs a double-precision host reference; exits 0 PASS / 1 FAIL / 3 non-sm_100a |
+| `crates/patina/tests/hw_run.rs` + `crates/patina/src/run.rs` | DSL → hardware | on a GB200 only (`cargo test --features cuda --test hw_run`) | the same loop in Rust: `patina::run` declares the `cuda.h` C ABI via FFI and links `libcuda.so`, tracing→lowering→launching→checking in one `cargo test`; skips vacuously off-Blackwell |
+| `crates/patina/tests/run_smoke.rs` | driver plumbing | any GPU (`cargo test --features cuda --test run_smoke`) | runs a trivial `vec_add` PTX through `patina::run::Cuda` (load→launch→copy→check) on the *current* device, so the driver-API path is proven locally before GB200; also asserts tcgen05 kernels are gated on sm_100a |
+
 
 ## Running (once the code exists)
+
+All of the below (plus the harness build) is automated by `./scripts/preflight.sh`.
+Hardware (GB200) execution is covered in `docs/HARDWARE_TESTING.md`.
 
 ```bash
 # M1a: layout algebra only — first tests that should pass

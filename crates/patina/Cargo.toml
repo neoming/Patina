@@ -3,3 +3,9 @@ name = "patina"
 version = "0.1.0"
 edition = "2021"
 description = "A thin typed layer over tcgen05: Rust DSL tracing Blackwell kernels into the Patina MLIR dialect"
+
+[features]
+default = []
+# Links libcuda.so and enables `patina::run` (hardware execution via the CUDA
+# driver API). Requires an NVIDIA driver at build/runtime.
+cuda = []

@@ -8,6 +8,9 @@ pub mod layout;
 pub mod testing;
 pub mod trace;
 
+#[cfg(feature = "cuda")]
+pub mod run;
+
 pub(crate) mod emit;
 
 /// The full DSL surface: `use patina::prelude::*;`.
